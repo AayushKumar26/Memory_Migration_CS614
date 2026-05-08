@@ -1,0 +1,2 @@
+config,attempted,succeeded,failed,dur_ns,pages_per_sec,failure_rate
+E_rand_rmw_t4_c512,131072,131072,0,3858555611,33969,0.0000

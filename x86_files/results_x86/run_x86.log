@@ -1,0 +1,697 @@
+
+[0;36m══════════════════════════════════════════════════════[0m
+[0;36m  CS614 x86_64 O1+O3 NUMA Migration Optimisation — Artifact Evaluation[0m
+[0;36m══════════════════════════════════════════════════════[0m
+
+[0;36m[INFO][0m  Results directory : /home/aayush/project/eval_scripts/results_x86
+[0;36m[INFO][0m  Log file          : /home/aayush/project/eval_scripts/results_x86/run_x86.log
+[0;36m[INFO][0m  Timestamp         : Saturday 25 April 2026 08:02:22 PM IST
+
+[0;36m══════════════════════════════════════════════════════[0m
+[0;36m  Step 1: Preflight checks[0m
+[0;36m══════════════════════════════════════════════════════[0m
+
+[0;32m[OK][0m    Running as root
+[0;32m[OK][0m    Architecture: x86_64
+[0;36m[INFO][0m  Kernel version: 6.1.4
+[0;32m[OK][0m    Debugfs accessible
+[0;32m[OK][0m    rmap patch active (25 columns detected)
+[0;32m[OK][0m    O1: batch function found
+[0;32m[OK][0m    NUMA nodes: 6
+[0;32m[OK][0m    NUMA auto-balancing disabled
+
+[0;36m══════════════════════════════════════════════════════[0m
+[0;36m  Step 2: Build userspace benchmarks[0m
+[0;36m══════════════════════════════════════════════════════[0m
+
+/home/aayush/project/eval_scripts/mig_bench_x86.c:941:13: warning: ‘benchmark_downtime’ defined but not used [-Wunused-function]
+  941 | static void benchmark_downtime(int access_cpu, int migrate_cpu,
+      |             ^~~~~~~~~~~~~~~~~~
+/home/aayush/project/eval_scripts/mig_bench_x86.c:663:13: warning: ‘dt_calibrate_timer’ defined but not used [-Wunused-function]
+  663 | static void dt_calibrate_timer(void)
+      |             ^~~~~~~~~~~~~~~~~~
+[0;32m[OK][0m    Benchmarks built
+
+[0;36m══════════════════════════════════════════════════════[0m
+[0;36m  Step 3: Benchmarks A, B, C, D — Quiescent + Downtime[0m
+[0;36m══════════════════════════════════════════════════════[0m
+
+[0;36m[INFO][0m  Estimated runtime: ~5 minutes
+╔══════════════════════════════════════════════════════╗
+║   Migration Function Decomposition Benchmark         ║
+║   x86_64 / Linux 6.1.4 / 4KB pages / numa=fake=2   ║
+╚══════════════════════════════════════════════════════╝
+
+  NUMA nodes: 2 (nodes 0..1)
+  Source node: 0   Destination node: 1
+  Debugfs interface: /sys/kernel/debug/mig_timing ✓
+  model name	: Intel(R) Xeon(R) Gold 6226R CPU @ 2.90GHz
+  Pinned to CPU 0
+
+
+┌──────────────────────────────────────────────────────┐
+│  Benchmark A: 4KB Base Page Migration                │
+│  Count: 512     Node 0 → Node 1                      │
+└──────────────────────────────────────────────────────┘
+  Allocating 512 × 4KB pages on node 0 ...
+  Placement verified: all 512 pages on node 0
+  Migrating to node 1 ...
+  Succeeded: 512/512   Failed: 0
+  Wall time: 2.4 ms   Throughput: 817 MB/s
+  Timing data → timing_4kb_512.csv
+
+┌──────────────────────────────────────────────────────┐
+│  Benchmark A: 4KB Base Page Migration                │
+│  Count: 2048    Node 0 → Node 1                      │
+└──────────────────────────────────────────────────────┘
+  Allocating 2048 × 4KB pages on node 0 ...
+  Placement verified: all 2048 pages on node 0
+  Migrating to node 1 ...
+  Succeeded: 2048/2048   Failed: 0
+  Wall time: 11.8 ms   Throughput: 678 MB/s
+  Timing data → timing_4kb_2048.csv
+
+┌──────────────────────────────────────────────────────┐
+│  Benchmark B: 2MB THP Migration                      │
+│  Count: 32      Node 0 → Node 1                      │
+└──────────────────────────────────────────────────────┘
+  THP status: always [madvise] never
+  Allocating 32 × 2MB THPs on node 0 ...
+  THP backing confirmed for sampled pages
+  Migrating to node 1 ...
+  Succeeded: 32/32   Failed: 0
+  Wall time: 31.3 ms   Throughput: 2046 MB/s
+  Timing data → timing_2mb_32.csv
+
+┌──────────────────────────────────────────────────────┐
+│  Benchmark B: 2MB THP Migration                      │
+│  Count: 128     Node 0 → Node 1                      │
+└──────────────────────────────────────────────────────┘
+  THP status: always [madvise] never
+  Allocating 128 × 2MB THPs on node 0 ...
+  THP backing confirmed for sampled pages
+  Migrating to node 1 ...
+  Succeeded: 128/128   Failed: 0
+  Wall time: 118.1 ms   Throughput: 2168 MB/s
+  Timing data → timing_2mb_128.csv
+
+┌──────────────────────────────────────────────────────┐
+│  Benchmark C: Shared Page Migration (rmap scaling)  │
+└──────────────────────────────────────────────────────┘
+
+  [Shared] degree=1    pages=64   node 0→1
+  Succeeded: 64/64   Wall: 0.6 ms
+  Timing data → timing_shared_deg001.csv
+
+  [Shared] degree=2    pages=64   node 0→1
+  Succeeded: 64/64   Wall: 0.6 ms
+  Timing data → timing_shared_deg002.csv
+
+  [Shared] degree=4    pages=64   node 0→1
+  Succeeded: 64/64   Wall: 0.8 ms
+  Timing data → timing_shared_deg004.csv
+
+  [Shared] degree=8    pages=64   node 0→1
+  Succeeded: 64/64   Wall: 1.0 ms
+  Timing data → timing_shared_deg008.csv
+
+  [Shared] degree=16   pages=64   node 0→1
+  Succeeded: 64/64   Wall: 1.2 ms
+  Timing data → timing_shared_deg016.csv
+
+  [Shared] degree=32   pages=64   node 0→1
+  Succeeded: 64/64   Wall: 2.6 ms
+  Timing data → timing_shared_deg032.csv
+
+  [Shared] degree=64   pages=64   node 0→1
+  Succeeded: 64/64   Wall: 4.0 ms
+  Timing data → timing_shared_deg064.csv
+
+  [skip] Benchmark D: Migration Downtime disabled.
+  (comment back in to enable — see /* Benchmark D */ block)
+
+
+══════════════════════════════════════════════════════
+  All benchmarks complete.
+  Run: python3 analyze_timing.py timing_*.csv
+       python3 analyze_downtime.py downtime_*.csv
+══════════════════════════════════════════════════════
+
+
+[0;36m══════════════════════════════════════════════════════[0m
+[0;36m  Step 4: Stage Timing Analysis & Plotting (A, B, C)[0m
+[0;36m══════════════════════════════════════════════════════[0m
+
+[1;33m[WARN][0m  analyze_timing.py not found — skipping plot generation
+
+[0;36m══════════════════════════════════════════════════════[0m
+[0;36m  Step 5: T5 — Quiescent Sub-Component Decomposition[0m
+[0;36m══════════════════════════════════════════════════════[0m
+
+[0;36m[INFO][0m  Analyzing O1+O3 metrics via analyze_unmap.py...
+Loaded 2048 records from /home/aayush/project/eval_scripts/results_x86/timing_4kb_2048.csv
+========================================================================
+T5: Full Sub-Component Decomposition (rmap patch fields)
+------------------------------------------------------------------------
+  Records with non-zero ipi_wait_ns: 384/2048
+
+  Total try_migrate():
+    n=  2048  mean=    824.4 ns  median=    787.0 ns  std=    483.8 ns  CV=0.587  p99=   1078.6 ns
+  H3 rwsem acquisition:
+    n=  2048  mean=     34.6 ns  median=     34.0 ns  std=      4.3 ns  CV=0.126  p99=     60.0 ns
+  H2 page-table spinlock:
+    n=  2048  mean=    535.1 ns  median=    509.0 ns  std=    445.1 ns  CV=0.832  p99=    755.3 ns
+  H1 ptep_clear_flush (IPI):
+    n=  2048  mean=      0.2 ns  median=      0.0 ns  std=      0.4 ns  CV=2.164  p99=      2.0 ns
+
+  Nesting note: ipi_ns is measured INSIDE the ptl bracket.
+  ptl_ns = ipi_ns + other-PTE-work.  outside = tm - rwsem - ptl.
+
+  ── Median-based breakdown (USE THIS — robust to VM/kswapd outliers) ──
+    Component                                median ns         %
+    ──────────────────────────────────────  ──────────  ────────
+    H3  rwsem (down_read acquisition)             34.0      4.3%
+    H1  ipi   (flush_tlb_others)                   0.0      0.0%
+        other PTE body (page_remove_rmap)        509.0     64.7%
+        outside-ptl (rmap/ptbl walk)             244.0     31.0%
+    ──────────────────────────────────────  ──────────
+    try_migrate_ns (median)                      787.0  100.0%
+
+  CV rwsem         : 0.13
+  CV ptl           : 0.83
+  CV ipi           : 2.16
+  CV try_migrate   : 0.59
+
+  Raw bracket values (mean-based, nested — do not sum to 100%):
+    Bracket                              mean ns    % of try_migrate
+    ────────────────────────────────  ──────────  ──────────────────
+    try_migrate_ns  (total)                824.4              100.0%
+      rwsem_ns      (H3)                    34.6                4.2%
+      ptl_ns        (H2+H1)                535.1               64.9%
+        ipi_ns      (H1)                     0.2                0.0%
+
+  Non-overlapping breakdown (sums to 100%):
+    Component                                  mean ns         %
+    ──────────────────────────────────────  ──────────  ────────
+    H3  rwsem (uncontended down_read)             34.6      4.2%
+    H1  ipi   (flush_tlb_others)                   0.2      0.0%
+        other PTE body (page_remove_rmap)        534.9     64.9%
+        outside-ptl (rmap/ptbl walk)             254.7     30.9%
+    ──────────────────────────────────────  ──────────
+    total                                        824.4    100.0%
+
+  ── Verdict ─────────────────────────────────────────────────
+  H1 IPI        : 0.0%  (flush_tlb_others roundtrip)
+  H2 ptl-hold   : 64.9%  (legitimate PTE work in quiescent run;
+                          contention only appears under Bench-E load)
+  H3 rwsem      : 4.2%  (uncontended down_read cost)
+  structural    : 30.9%  (rmap tree walk + 4-level page table walk)
+
+  DOMINANT: non-IPI PTE body work (page_remove_rmap atomic ops).
+  NOTE: in a quiescent run this is NOT spinlock contention.
+  Run T4 with Bench-E loaded CSV to measure actual H2 contention.
+
+  NOTE: H2 (actual pte_lockptr *contention*) is only visible under
+  concurrent load. Run: python3 analyze_unmap.py --t4 quiescent.csv loaded.csv
+  where loaded.csv comes from a Bench-E run.
+
+========================================================================
+Analysis complete.
+Loaded 2048 records from /home/aayush/project/eval_scripts/results_x86/timing_4kb_2048.csv
+========================================================================
+T2: Cache Thrash Detection (H4)
+------------------------------------------------------------------------
+  Hypothesis: anon_vma tree and page-table nodes are cold after
+  32+ migrations, causing try_migrate_ns to rise with seq number.
+
+    Quintile         seq range       n     mean ns   median ns      std ns
+          Q1        1–    409     409       815.1       780.0       411.2
+          Q2      410–    818     409       855.6       784.0       918.6
+          Q3      819–   1227     409       813.2       798.0        62.6
+          Q4     1228–   1636     409       820.6       788.0       391.0
+          Q5     1637–   2048     412       817.6       809.5        58.9
+
+  Q5/Q1 mean ratio   : 1.003
+  Monotonically rising quintile pairs: 2/4
+
+  RESULT → H4 NOT SUPPORTED: Q5/Q1 ratio < 1.10.
+  No significant cache thrash signal.  IPI or spinlock likely dominant.
+
+  First-32 mean : 842.5 ns
+  Last-32 mean  : 792.7 ns
+  Ratio last/first: 0.941
+
+========================================================================
+Analysis complete.
+Loaded 2048 records from /home/aayush/project/eval_scripts/results_x86/timing_4kb_2048.csv
+========================================================================
+T3: rwsem Contention / kswapd Outlier Detection (H3)
+------------------------------------------------------------------------
+  Hypothesis: kswapd write-locks anon_vma->rwsem during LRU reclaim,
+  causing outlier spikes in try_migrate_ns that cluster in seq-time.
+
+  Total mapped records : 2048
+  Median try_migrate_ns: 787.0 ns
+  Outlier threshold    : 3935.0 ns  (5 × median)
+  Outlier count        : 4 (0.2%)
+
+  Outlier seq range    : 130 – 1454  (span=1324)
+  Full seq range       : 1 – 2048
+  Outlier seq fraction : 0.647 of full range
+
+  Top-10 outlier records (seq, try_migrate_ns, unmap_ns):
+    seq=   722  try_migrate_ns=     17678  unmap_ns=     17678
+    seq=   130  try_migrate_ns=      8778  unmap_ns=      8778
+    seq=  1454  try_migrate_ns=      8644  unmap_ns=      8644
+    seq=   533  try_migrate_ns=      8530  unmap_ns=      8530
+
+  RESULT → H3 AMBIGUOUS: outlier span = 64.7% of range.
+  Outliers are spread out — more consistent with IPI variance than
+  kswapd contention (which would cluster in a burst).
+
+  try_migrate_ns CV    : 0.587
+  CV ≤ 1.0 — moderate variance; IPI cost is bounded and consistent.
+
+========================================================================
+Analysis complete.
+[0;36m[INFO][0m  Verifying O3 Address-Ordered Walk Cost...
+  Median structural walk (outside PTL): 242 ns
+
+[0;36m══════════════════════════════════════════════════════[0m
+[0;36m  Step 6: Analyse Migration Downtime (Benchmark D)[0m
+[0;36m══════════════════════════════════════════════════════[0m
+
+
+[0;36m══════════════════════════════════════════════════════[0m
+[0;36m  Step 7: Benchmark E — Concurrent Load[0m
+[0;36m══════════════════════════════════════════════════════[0m
+
+  NOTE: clamping 4 workers to 2 (available worker CPUs)
+  NOTE: clamping 4 workers to 2 (available worker CPUs)
+  NOTE: clamping 4 workers to 2 (available worker CPUs)
+  TSC calibration: 0.346 ns/tick  (2893 MHz)
+╔══════════════════════════════════════════════════════╗
+║   Benchmark E: Multi-Threaded NUMA Migration         ║
+║   x86_64 / Linux 6.1.4 / 512 MB buf / numa=fake=2   ║
+╚══════════════════════════════════════════════════════╝
+
+  Node 0 CPUs  : 0 1
+  Node 1 CPUs  : 2 3
+  Migrator CPU : 0  (node 0)
+  Workers pin  : node 1 CPUs
+
+┌──────────────────────────────────────────────────────┐
+│  Config 1/7: E_rand_rmw_t4_c512                        │
+│  rand      rmw     2 workers  chunk=512 pages            │
+│  Phases: 10 s / 30 s / 10 s                            │
+└──────────────────────────────────────────────────────┘
+
+  Allocating 512 MB buffer on node 0 ...
+  Faulting in 131072 pages (this is the initial memset) ...
+  Pre-migration: 256/256 sampled pages on node 0 (src)
+  [Phase 1] Baseline — 10 s, workers remote-accessing node0 ...
+  [Phase 2] Migration — 30 s, chunk=512 pages, migrator node0→node1 ...
+  Post-migration: 256/256 sampled pages on node 1 (dst)
+  [Phase 3] Steady state — 10 s, workers local-accessing node1 ...
+  Worker CSV    → bench_e_workers_x86_E_rand_rmw_t4_c512.csv
+  Migrator CSV  → bench_e_migrator_x86_E_rand_rmw_t4_c512.csv
+  Ring buffer   → bench_e_timing_x86_E_rand_rmw_t4_c512.csv
+  (ring wraps during 30 s Phase 2 — data is a statistical sample)
+
+  Phase       Ops/s (total)       GB/s     p50 ns     p999 ns
+  ─────  ─────────────  ────────  ──────  ───────
+  Baseline        1.781e+07     0.1425        189         576
+  Migration       3.026e+07     0.2421        134         525
+  Steady          3.232e+07     0.2585        132         502
+
+  Migration: 131072 attempted, 131072 succeeded, 0 failed
+  Migration: 24667 pages/s  duration 5314 ms  failure 0.0%
+
+┌──────────────────────────────────────────────────────┐
+│  Config 2/7: E_seq_read_t4_c512                        │
+│  seq       read    2 workers  chunk=512 pages            │
+│  Phases: 10 s / 30 s / 10 s                            │
+└──────────────────────────────────────────────────────┘
+
+  Allocating 512 MB buffer on node 0 ...
+  Faulting in 131072 pages (this is the initial memset) ...
+  Pre-migration: 256/256 sampled pages on node 0 (src)
+  [Phase 1] Baseline — 10 s, workers remote-accessing node0 ...
+  [Phase 2] Migration — 30 s, chunk=512 pages, migrator node0→node1 ...
+  Post-migration: 256/256 sampled pages on node 1 (dst)
+  [Phase 3] Steady state — 10 s, workers local-accessing node1 ...
+  Worker CSV    → bench_e_workers_x86_E_seq_read_t4_c512.csv
+  Migrator CSV  → bench_e_migrator_x86_E_seq_read_t4_c512.csv
+  Ring buffer   → bench_e_timing_x86_E_seq_read_t4_c512.csv
+  (ring wraps during 30 s Phase 2 — data is a statistical sample)
+
+  Phase       Ops/s (total)       GB/s     p50 ns     p999 ns
+  ─────  ─────────────  ────────  ──────  ───────
+  Baseline        4.550e+07     0.3640        154         608
+  Migration       9.772e+07     0.7817        112         530
+  Steady          9.946e+07     0.7957         89         471
+
+  Migration: 131072 attempted, 131072 succeeded, 0 failed
+  Migration: 99188 pages/s  duration 1321 ms  failure 0.0%
+
+┌─────────────────────────  NOTE: clamping 8 workers to 2 (available worker CPUs)
+─────────────────────────────┐
+│  Config 3/7: E_rand_read_t4_c512                       │
+│  rand      read    2 workers  chunk=512 pages            │
+│  Phases: 10 s / 30 s / 10 s                            │
+└──────────────────────────────────────────────────────┘
+
+  Allocating 512 MB buffer on node 0 ...
+  Faulting in 131072 pages (this is the initial memset) ...
+  Pre-migration: 256/256 sampled pages on node 0 (src)
+  [Phase 1] Baseline — 10 s, workers remote-accessing node0 ...
+  [Phase 2] Migration — 30 s, chunk=512 pages, migrator node0→node1 ...
+  Post-migration: 256/256 sampled pages on node 1 (dst)
+  [Phase 3] Steady state — 10 s, workers local-accessing node1 ...
+  Worker CSV    → bench_e_workers_x86_E_rand_read_t4_c512.csv
+  Migrator CSV  → bench_e_migrator_x86_E_rand_read_t4_c512.csv
+  Ring buffer   → bench_e_timing_x86_E_rand_read_t4_c512.csv
+  (ring wraps during 30 s Phase 2 — data is a statistical sample)
+
+  Phase       Ops/s (total)       GB/s     p50 ns     p999 ns
+  ─────  ─────────────  ────────  ──────  ───────
+  Baseline        4.286e+07     0.3429        156         541
+  Migration       7.729e+07     0.6183        104         512
+  Steady          7.846e+07     0.6277        103         506
+
+  Migration: 131072 attempted, 131072 succeeded, 0 failed
+  Migration: 104843 pages/s  duration 1250 ms  failure 0.0%
+
+┌──────────────────────────────────────────────────────┐
+│  Config 4/7: E_rand_rmw_t1_c512                        │
+│  rand      rmw     1 workers  chunk=512 pages            │
+│  Phases: 10 s / 30 s / 10 s                            │
+└──────────────────────────────────────────────────────┘
+
+  Allocating 512 MB buffer on node 0 ...
+  Faulting in 131072 pages (this is the initial memset) ...
+  Pre-migration: 256/256 sampled pages on node 0 (src)
+  [Phase 1] Baseline — 10 s, workers remote-accessing node0 ...
+  [Phase 2] Migration — 30 s, chunk=512 pages, migrator node0→node1 ...
+  Post-migration: 256/256 sampled pages on node 1 (dst)
+  [Phase 3] Steady state — 10 s, workers local-accessing node1 ...
+  Worker CSV    → bench_e_workers_x86_E_rand_rmw_t1_c512.csv
+  Migrator CSV  → bench_e_migrator_x86_E_rand_rmw_t1_c512.csv
+  Ring buffer   → bench_e_timing_x86_E_rand_rmw_t1_c512.csv
+  (ring wraps during 30 s Phase 2 — data is a statistical sample)
+
+  Phase       Ops/s (total)       GB/s     p50 ns     p999 ns
+  ─────  ─────────────  ────────  ──────  ───────
+  Baseline        1.252e+07     0.1002        186         548
+  Migration       1.683e+07     0.1346        131         502
+  Steady          1.690e+07     0.1352        130         496
+
+  Migration: 131072 attempted, 131072 succeeded, 0 failed
+  Migration: 279640 pages/s  duration 469 ms  failure 0.0%
+
+┌──────────────────────────────────────────────────────┐
+│  Config 5/7: E_rand_rmw_t8_c512                        │
+│  rand      rmw     2 workers  chunk=512 pages            │
+│  Phases: 10 s / 30 s / 10 s                            │
+└──────────────────────────────────────────────────────┘
+
+  Allocating 512 MB buffer on node 0 ...
+  Faulting in 131072 pages (this is the initial memset) ...
+  Pre-migration: 256/256 sampled pages on node 0 (src)
+  [Phase 1] Baseline — 10 s, workers remote-accessing node0 ...
+  [Pha  NOTE: clamping 4 workers to 2 (available worker CPUs)
+  NOTE: clamping 4 workers to 2 (available worker CPUs)
+se 2] Migration — 30 s, chunk=512 pages, migrator node0→node1 ...
+  Post-migration: 256/256 sampled pages on node 1 (dst)
+  [Phase 3] Steady state — 10 s, workers local-accessing node1 ...
+  Worker CSV    → bench_e_workers_x86_E_rand_rmw_t8_c512.csv
+  Migrator CSV  → bench_e_migrator_x86_E_rand_rmw_t8_c512.csv
+  Ring buffer   → bench_e_timing_x86_E_rand_rmw_t8_c512.csv
+  (ring wraps during 30 s Phase 2 — data is a statistical sample)
+
+  Phase       Ops/s (total)       GB/s     p50 ns     p999 ns
+  ─────  ─────────────  ────────  ──────  ───────
+  Baseline        1.858e+07     0.1487        190         579
+  Migration       3.210e+07     0.2568        134         532
+  Steady          3.273e+07     0.2618        133         508
+
+  Migration: 131072 attempted, 131072 succeeded, 0 failed
+  Migration: 100575 pages/s  duration 1303 ms  failure 0.0%
+
+┌──────────────────────────────────────────────────────┐
+│  Config 6/7: E_rand_rmw_t4_c1                          │
+│  rand      rmw     2 workers  chunk=1 pages            │
+│  Phases: 10 s / 30 s / 10 s                            │
+└──────────────────────────────────────────────────────┘
+
+  Allocating 512 MB buffer on node 0 ...
+  Faulting in 131072 pages (this is the initial memset) ...
+  Pre-migration: 256/256 sampled pages on node 0 (src)
+  [Phase 1] Baseline — 10 s, workers remote-accessing node0 ...
+  [Phase 2] Migration — 30 s, chunk=1 pages, migrator node0→node1 ...
+  Post-migration: 32/256 sampled pages on node 1 (dst)
+  [Phase 3] Steady state — 10 s, workers local-accessing node1 ...
+  Worker CSV    → bench_e_workers_x86_E_rand_rmw_t4_c1.csv
+  Migrator CSV  → bench_e_migrator_x86_E_rand_rmw_t4_c1.csv
+  Ring buffer   → bench_e_timing_x86_E_rand_rmw_t4_c1.csv
+  (ring wraps during 30 s Phase 2 — data is a statistical sample)
+
+  Phase       Ops/s (total)       GB/s     p50 ns     p999 ns
+  ─────  ─────────────  ────────  ──────  ───────
+  Baseline        1.658e+07     0.1326        188         580
+  Migration       1.947e+07     0.1558        189         582
+  Steady          2.494e+07     0.1995        187         590
+
+  Migration: 16028 attempted, 16028 succeeded, 0 failed
+  Migration: 534 pages/s  duration 30001 ms  failure 0.0%
+
+┌──────────────────────────────────────────────────────┐
+│  Config 7/7: E_rand_rmw_t4_c64                         │
+│  rand      rmw     2 workers  chunk=64 pages            │
+│  Phases: 10 s / 30 s / 10 s                            │
+└──────────────────────────────────────────────────────┘
+
+  Allocating 512 MB buffer on node 0 ...
+  Faulting in 131072 pages (this is the initial memset) ...
+  Pre-migration: 256/256 sampled pages on node 0 (src)
+  [Phase 1] Baseline — 10 s, workers remote-accessing node0 ...
+  [Phase 2] Migration — 30 s, chunk=64 pages, migrator node0→node1 ...
+  Post-migration: 256/256 sampled pages on node 1 (dst)
+  [Phase 3] Steady state — 10 s, workers local-accessing node1 ...
+  Worker CSV    → bench_e_workers_x86_E_rand_rmw_t4_c64.csv
+  Migrator CSV  → bench_e_migrator_x86_E_rand_rmw_t4_c64.csv
+  Ring buffer   → bench_e_timing_x86_E_rand_rmw_t4_c64.csv
+  (ring wraps during 30 s Phase 2 — data is a statistical sample)
+
+  Phase       Ops/s (total)       GB/s     p50 ns     p999 ns
+  ─────  ─────────────  ────────  ──────  ───────
+  Baseline        1.272e+07     0.1018        186         550
+  Migration       3.115e+07     0.2492        136         536
+  Steady          3.280e+07     0.2624        134         520
+
+  Migration: 131072 attempted, 131072 succeeded, 0 failed
+  Migration: 28653 pages/s  duration 4574 ms  failure 0.0%
+
+══════════════════════════════════════════════════════
+  All Benchmark E runs complete.
+  Outputs: bench_e_workers_x86_*.csv
+           bench_e_migrator_x86_*.csv
+           bench_e_timing_x86_*.csv  (ring buffer samples)
+  Analyze: python3 analyze_bench_e_x86.py
+══════════════════════════════════════════════════════
+
+[0;32m[OK][0m    Benchmark E complete
+[0;36m[INFO][0m  Running Benchmark E analysis (analyze_bench_e_x86.py)...
+╔══════════════════════════════════════════════════════╗
+║  Benchmark E Analysis: Multi-Threaded NUMA Migration ║
+║  x86_64 / Linux 6.1.4 / numa=fake=2                 ║
+╚══════════════════════════════════════════════════════╝
+
+  Worker CSVs   : 7 configs
+  Migrator CSVs : 7 configs
+  Ring buffer E : 7 files
+  Ring buffer A : 2 files (quiescent reference)
+
+
+════════════════════════════════════════════════════════════════════════════════════════════════════
+  BENCHMARK E (x86_64) — THROUGHPUT SUMMARY
+════════════════════════════════════════════════════════════════════════════════════════════════════
+  Config                                  Phase  Threads        Ops/s     GB/s    p50 ns    p99 ns    p999 ns
+  ──────────────────────────────────────────────────────────────────────────────────────────────────
+  E_rand_read_t4_c512                  baseline        2    4.286e+07   0.3429       156       476        541
+                                      migration        2    7.729e+07   0.6183       104       450        512
+                                         steady        2    7.846e+07   0.6277       103       446        506
+
+  E_rand_rmw_t1_c512                   baseline        1    1.252e+07   0.1002       186       513        548
+                                      migration        1    1.683e+07   0.1346       131       432        502
+                                         steady        1    1.690e+07   0.1352       130       440        496
+
+  E_rand_rmw_t4_c1                     baseline        2    1.658e+07   0.1326       188       516        580
+                                      migration        2    1.947e+07   0.1558       189       523        582
+                                         steady        2    2.494e+07   0.1995       187       520        590
+
+  E_rand_rmw_t4_c512                   baseline        2    1.781e+07   0.1425       189       522        576
+                                      migration        2    3.026e+07   0.2421       134       451        525
+                                         steady        2    3.232e+07   0.2585       132       446        502
+
+  E_rand_rmw_t4_c64                    baseline        2    1.272e+07   0.1018       186       517        550
+                                      migration        2    3.115e+07   0.2492       136       454        536
+                                         steady        2    3.280e+07   0.2624       134       454        520
+
+  E_rand_rmw_t8_c512                   baseline        2    1.858e+07   0.1487       190       522        579
+                                      migration        2    3.210e+07   0.2568       134       457        532
+                                         steady        2    3.273e+07   0.2618       133       448        508
+
+  E_seq_read_t4_c512                   baseline        2    4.550e+07   0.3640       154       511        608
+                                      migration        2    9.772e+07   0.7817       112       450        530
+                                         steady        2    9.946e+07   0.7957        89       438        471
+
+
+════════════════════════════════════════════════════════════════════════════════════════════════════
+  BENCHMARK E (x86_64) — BREAK-EVEN TIME
+  Break-even = time after migration completes to recover disruption cost
+  Note: with numa=fake=2 there is no real latency gain → break-even → ∞ is expected
+════════════════════════════════════════════════════════════════════════════════════════════════════
+  Config                                 P1 ops/s     P2 ops/s     P3 ops/s  DF (P2/P1)  Benefit (P3/P1)   Break-even
+  ──────────────────────────────────────────────────────────────────────────────────────────────────
+  E_rand_read_t4_c512                   4.286e+07    7.729e+07    7.846e+07       1.803            1.831        0.0 s
+  E_rand_rmw_t1_c512                    1.252e+07    1.683e+07    1.690e+07       1.344            1.350        0.0 s
+  E_rand_rmw_t4_c1                      1.658e+07    1.947e+07    2.494e+07       1.175            1.504        0.0 s
+  E_rand_rmw_t4_c512                    1.781e+07    3.026e+07    3.232e+07       1.699            1.815        0.0 s
+  E_rand_rmw_t4_c64                     1.272e+07    3.115e+07    3.280e+07       2.449            2.578        0.0 s
+  E_rand_rmw_t8_c512                    1.858e+07    3.210e+07    3.273e+07       1.728            1.761        0.0 s
+  E_seq_read_t4_c512                    4.550e+07    9.772e+07    9.946e+07       2.148            2.186        0.0 s
+
+════════════════════════════════════════════════════════════════════════════════════════════════════
+  BENCHMARK E (x86_64) — MIGRATION STATISTICS
+════════════════════════════════════════════════════════════════════════════════════════════════════
+  Config                              Attempted  Succeeded   Failed    Pages/s   Fail %   Dur (ms)
+  ──────────────────────────────────────────────────────────────────────────────────────────────────
+  E_rand_read_t4_c512                    131072     131072        0     104843      0.0     1250.2
+  E_rand_rmw_t1_c512                     131072     131072        0     279640      0.0      468.7
+  E_rand_rmw_t4_c1                        16028      16028        0        534      0.0    30000.9
+  E_rand_rmw_t4_c512                     131072     131072        0      24667      0.0     5313.7
+  E_rand_rmw_t4_c64                      131072     131072        0      28653      0.0     4574.5
+  E_rand_rmw_t8_c512                     131072     131072        0     100575      0.0     1303.2
+  E_seq_read_t4_c512                     131072     131072        0      99188      0.0     1321.5
+
+════════════════════════════════════════════════════════════════════════════════════════════════════
+  BENCHMARK E (x86_64) — RING BUFFER STAGE STATISTICS (Phase 2 sample)
+  Note: ring buffer wraps during 30 s Phase 2. Stage data is a statistical sample, not a complete record.
+════════════════════════════════════════════════════════════════════════════════════════════════════
+
+  BenchA/4kb_2048  (2048 records)
+  Stage         Mean ns  Median ns     P99 ns   % of total
+  ─────         ───────  ─────────     ──────   ──────────
+  Lock                0          0          0         0.0%
+  Unmap             824        787       1079        49.1%
+  Copy              628        602       1036        37.1%
+  Remap             199        185        268        11.7%
+  Unlock             35         34         38         2.1%
+
+  BenchA/4kb_512  (512 records)
+  Stage         Mean ns  Median ns     P99 ns   % of total
+  ─────         ───────  ─────────     ──────   ──────────
+  Lock                0          0          0         0.0%
+  Unmap             825        793       1088        50.5%
+  Copy              580        531        916        35.2%
+  Remap             206        184        289        12.1%
+  Unlock             35         34         37         2.2%
+
+  BenchE/x86_E_rand_read_t4_c512  (16384 records)
+  Stage         Mean ns  Median ns     P99 ns   % of total
+  ─────         ───────  ─────────     ──────   ──────────
+  Lock                0          0          0         0.0%
+  Unmap             232        222        333        18.1%
+  Copy              874        829       1293        67.3%
+  Remap             152        145        216        11.8%
+  Unlock             44         30         36         2.7%
+
+  BenchE/x86_E_rand_rmw_t1_c512  (16384 records)
+  Stage         Mean ns  Median ns     P99 ns   % of total
+  ─────         ───────  ─────────     ──────   ──────────
+  Lock                0          0          0         0.0%
+  Unmap             236        223        348        18.1%
+  Copy              910        836       1287        67.6%
+  Remap             159        146        219        11.8%
+  Unlock             37         30         34         2.5%
+
+  BenchE/x86_E_rand_rmw_t4_c1  (16030 records)
+  Stage         Mean ns  Median ns     P99 ns   % of total
+  ─────         ───────  ─────────     ──────   ──────────
+  Lock                0          0          0         0.0%
+  Unmap             814        689       1955        33.2%
+  Copy             1236       1094       2521        51.8%
+  Remap             302        282        489        12.9%
+  Unlock             50         46         97         2.1%
+
+  BenchE/x86_E_rand_rmw_t4_c512  (16384 records)
+  Stage         Mean ns  Median ns     P99 ns   % of total
+  ─────         ───────  ─────────     ──────   ──────────
+  Lock                0          0          0         0.0%
+  Unmap             241        223        506        18.5%
+  Copy              875        835       1290        67.0%
+  Remap             153        146        238        11.9%
+  Unlock             38         31         45         2.6%
+
+  BenchE/x86_E_rand_rmw_t4_c64  (16384 records)
+  Stage         Mean ns  Median ns     P99 ns   % of total
+  ─────         ───────  ─────────     ──────   ──────────
+  Lock                0          0          0         0.0%
+  Unmap             242        222        806        18.0%
+  Copy              903        853       1574        68.0%
+  Remap             151        143        289        11.4%
+  Unlock             39         30         53         2.6%
+
+  BenchE/x86_E_rand_rmw_t8_c512  (16384 records)
+  Stage         Mean ns  Median ns     P99 ns   % of total
+  ─────         ───────  ─────────     ──────   ──────────
+  Lock                0          0          0         0.0%
+  Unmap             233        222        340        18.1%
+  Copy              871        833       1295        67.7%
+  Remap             148        143        209        11.6%
+  Unlock             37         30         34         2.6%
+
+  BenchE/x86_E_seq_read_t4_c512  (16384 records)
+  Stage         Mean ns  Median ns     P99 ns   % of total
+  ─────         ───────  ─────────     ──────   ──────────
+  Lock                0          0          0         0.0%
+  Unmap             233        223        347        18.3%
+  Copy              864        824       1279        67.4%
+  Remap             158        146        195        11.8%
+  Unlock             33         30         35         2.5%
+
+  Generating plots ...
+  Plot → ./bench_e_x86_throughput.png
+  Plot → ./bench_e_x86_latency.png
+  Plot → ./bench_e_x86_p999_threads.png
+  Plot → ./bench_e_x86_chunk_effect.png
+  Plot → ./bench_e_x86_stage_comparison.png
+  Plot → ./bench_e_x86_disruption_benefit.png
+
+  All plots saved to: /home/aayush/project/eval_scripts/results_x86/
+
+  Interpretation notes:
+  ┌─ Phase 2 p999 spike → migration-PTE stall on worker threads
+  │    Cross-reference with ring buffer Unmap+Copy+Remap window
+  ├─ Disruption Factor < 1 → migration hurts application throughput
+  ├─ Break-even → ∞ with numa=fake=2 (no real DRAM latency gain)
+  ├─ Unmap expected to dominate (IPI shootdown per PTE, ~2.68 µs)
+  │    Compare stage breakdown vs ARM64 to quantify IPI overhead
+  ├─ chunk=1 vs chunk=512: syscall overhead dominates at chunk=1;
+  │    kernel IPI batching saturates at chunk≥64 same as ARM64.
+  └─ Ring buffer wraps ~8×/pass during 30 s Phase 2 — treat as sample
+[0;32m[OK][0m    Benchmark E analysis and plots generated in /home/aayush/project/eval_scripts/results_x86/plots/
+
+[0;36m══════════════════════════════════════════════════════[0m
+[0;36m  Step 8: O1 Verification — Worker Disruption[0m
+[0;36m══════════════════════════════════════════════════════[0m
+
+  Disruption factor: 1.6999
+  ✓ O1 CONFIRMED: Batching significantly reduces TLB shootdown impact.
+
+[0;36m══════════════════════════════════════════════════════[0m
+[0;36m  Step 9: Artifact Evaluation Summary[0m
+[0;36m══════════════════════════════════════════════════════[0m
+
+[0;32m[OK][0m    Done. Full log: /home/aayush/project/eval_scripts/results_x86/run_x86.log

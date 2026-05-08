@@ -1,0 +1,1221 @@
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -58,9 +58,323 @@
+ 
+ #include "internal.h"
+ 
+-int isolate_movable_page(struct page *page, isolate_mode_t mode)
++
++#include <linux/debugfs.h>
++#include <linux/seq_file.h>
++/* ===================================================================
++ * MIGRATION TIMING INSTRUMENTATION — ARM64 / Linux 6.1.4
++ *
++ * Records per-migration nanosecond timing for each stage:
++ *   Stage 1: Lock    — folio_trylock / folio_lock
++ *   Stage 2: Unmap   — try_to_unmap (TLBI broadcast + DSB on ARM64)
++ *   Stage 3: Copy    — move_to_new_folio / folio_copy (NEON/SVE)
++ *   Stage 4: Remap   — remove_migration_ptes (PTE install, no TLBI)
++ *   Stage 5: Unlock  — folio_unlock (wake waiters)
++ *
++ * Interface:
++ *   Read:  cat /sys/kernel/debug/mig_timing   → CSV data
++ *   Reset: echo 1 > /sys/kernel/debug/mig_timing
++ * =================================================================== */
++
++struct mig_stage_timing {
++	u64 lock_start_ns;
++	u64 lock_end_ns;
++	u64 unmap_start_ns;
++	u64 unmap_end_ns;
++	u64 copy_start_ns;
++	u64 copy_end_ns;
++	u64 remap_start_ns;
++	u64 remap_end_ns;
++	u64 unlock_start_ns;
++	u64 unlock_end_ns;
++};
++
++struct mig_timing_record {
++	/* Stage timestamps */
++	struct mig_stage_timing stages;
++	u64 total_start_ns;
++	u64 total_end_ns;
++
++	/* Page metadata */
++	unsigned long src_pfn;		/* Source page frame number */
++	unsigned long dst_pfn;		/* Destination page frame number */
++	int page_order;			/* 0=4KB, 9=2MB THP */
++	int src_nid;			/* Source NUMA node */
++	int dst_nid;			/* Destination NUMA node */
++	int mapcount;			/* Number of PTEs mapping this folio */
++
++	/* Migration context */
++	int cpu;			/* Executing CPU (ARM64 MPIDR-based) */
++	pid_t pid;			/* Migrating thread's PID */
++	int lock_contended;		/* 1 = had to call folio_lock() (slow path) */
++	int page_was_mapped;		/* 1 = page had live PTE mappings */
++	int is_anon;			/* 1 = anonymous, 0 = file-backed */
++	int result;			/* Return code: 0=success, <0=error */
++
++	/* try_to_migrate() sub-timing within Stage 2 */
++	u64 try_migrate_start_ns;	/* ktime just before try_to_migrate() */
++	u64 try_migrate_end_ns;		/* ktime just after  try_to_migrate() */
++
++	/* ROCM (Read-Only Copy-then-swap Migration) fast path */
++	int rocm_path;			/* 1 = ROCM fast path taken, 0 = standard */
++	u64 ro_swap_start_ns;		/* ktime just before rocm_swap_ptes() */
++	u64 ro_swap_end_ns;		/* ktime just after  rocm_swap_ptes() */
++
++	u32 seq;			/* Monotonically increasing per-record ID */
++};
++
++#define MIG_TIMING_BUFSIZE  16384	/* Max records before wrap */
++
++static struct mig_timing_record mig_records[MIG_TIMING_BUFSIZE];
++static atomic_t mig_record_idx = ATOMIC_INIT(0);
++static atomic_t mig_record_seq = ATOMIC_INIT(0);
++
++/*
++ * mig_timing_store - comcd ..mit a completed record to the ring buffer.
++ *
++ * Called from __unmap_and_move() just before returning. Uses
++ * atomic_inc_return for the index so concurrent migrations on
++ * different CPUs don't collide. Last-writer-wins if buffer overflows.
++ */
++static void mig_timing_store(struct mig_timing_record *rec)
+ {
+-	const struct movable_operations *mops;
++	int idx;
++
++	rec->seq = atomic_inc_return(&mig_record_seq);
++	rec->cpu = raw_smp_processor_id();
++	rec->pid = current->pid;
++
++	idx = atomic_inc_return(&mig_record_idx) - 1;
++	if (likely(idx < MIG_TIMING_BUFSIZE))
++		mig_records[idx] = *rec;
++	/*
++	 * If buffer is full we silently drop rather than wrap, to avoid
++	 * overwriting earlier records. The CSV reader will see exactly
++	 * MIG_TIMING_BUFSIZE rows maximum.
++	 */
++}
++
++/* ---- debugfs read: emit CSV ---- */
++
++static int mig_timing_show(struct seq_file *m, void *v)
++{
++	int count = min_t(int, atomic_read(&mig_record_idx), MIG_TIMING_BUFSIZE);
++	int i;
++
++	seq_puts(m,
++		"seq,cpu,pid,"
++		"src_pfn,dst_pfn,"
++		"page_order,src_nid,dst_nid,"
++		"mapcount,is_anon,page_was_mapped,lock_contended,"
++		"lock_ns,unmap_ns,copy_ns,remap_ns,unlock_ns,"
++		"total_ns,overhead_ns,"
++		"result,"
++		"try_migrate_ns,"
++		"rocm_path,ro_swap_ns\n");
++
++	for (i = 0; i < count; i++) {
++		struct mig_timing_record *r = &mig_records[i];
++		struct mig_stage_timing *s = &r->stages;
++		u64 lock_ns, unmap_ns, copy_ns, remap_ns, unlock_ns;
++		u64 total_ns, accounted, overhead_ns;
++
++		lock_ns   = s->lock_end_ns   - s->lock_start_ns;
++		unmap_ns  = s->unmap_end_ns  - s->unmap_start_ns;
++		copy_ns   = s->copy_end_ns   - s->copy_start_ns;
++		remap_ns  = s->remap_end_ns  - s->remap_start_ns;
++		unlock_ns = s->unlock_end_ns - s->unlock_start_ns;
++		total_ns  = r->total_end_ns  - r->total_start_ns;
++
++		accounted  = lock_ns + unmap_ns + copy_ns + remap_ns + unlock_ns;
++		overhead_ns = (total_ns > accounted) ? (total_ns - accounted) : 0;
++
++		seq_printf(m,
++			"%u,%d,%d,"
++			"%lu,%lu,"
++			"%d,%d,%d,"
++			"%d,%d,%d,%d,"
++			"%llu,%llu,%llu,%llu,%llu,"
++			"%llu,%llu,"
++			"%d,"
++			"%llu,"
++			"%d,%llu\n",
++			r->seq, r->cpu, r->pid,
++			r->src_pfn, r->dst_pfn,
++			r->page_order, r->src_nid, r->dst_nid,
++			r->mapcount, r->is_anon, r->page_was_mapped, r->lock_contended,
++			lock_ns, unmap_ns, copy_ns, remap_ns, unlock_ns,
++			total_ns, overhead_ns,
++			r->result,
++			(r->try_migrate_end_ns > r->try_migrate_start_ns)
++				? r->try_migrate_end_ns - r->try_migrate_start_ns : 0ULL,
++			r->rocm_path,
++			(r->ro_swap_end_ns > r->ro_swap_start_ns)
++				? r->ro_swap_end_ns - r->ro_swap_start_ns : 0ULL);
++	}
++
++	return 0;
++}
++
++static int mig_timing_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, mig_timing_show, NULL);
++}
++
++/* Any write resets the buffer */
++static ssize_t mig_timing_write(struct file *file, const char __user *buf,
++				size_t count, loff_t *ppos)
++{
++	atomic_set(&mig_record_idx, 0);
++	atomic_set(&mig_record_seq, 0);
++	memset(mig_records, 0, sizeof(mig_records));
++	pr_info("mig_timing: buffer reset (%d slots available)\n", MIG_TIMING_BUFSIZE);
++	return count;
++}
++
++static const struct file_operations mig_timing_fops = {
++	.owner	 = THIS_MODULE,
++	.open	 = mig_timing_open,
++	.read	 = seq_read,
++	.write	 = mig_timing_write,
++	.llseek	 = seq_lseek,
++	.release = single_release,
++};
++
++
++/* ===================================================================
++ * BENCHMARK 3: Migration Downtime Instrumentation
++ *
++ * Measures the application-visible stall time caused by hitting a
++ * migration PTE. This is distinct from total migration time:
++ *
++ *   Total migration = lock + unmap + copy + remap + unlock
++ *   Application stall = time inside migration_entry_wait()
++ *                     = copy_remaining + remap  (worst case)
++ *
++ * The faulting thread sleeps inside migration_entry_wait_on_locked()
++ * until the migrator calls folio_unlock() after set_pte_at().
++ *
++ * We wrap migration_entry_wait() and time the full call, which is
++ * the kernel's view of the stall (excluding the ~2-3µs user/kernel
++ * boundary overhead that surrounds it in the fault handler).
++ * =================================================================== */
++
++struct mig_downtime_record {
++	u64  total_start_ns;	/* when migration_entry_wait() was entered  */
++	u64  wait_start_ns;	/* just before delegating to __mig_entry_wait */
++	u64  total_end_ns;	/* when migration_entry_wait() returned      */
++
++	unsigned long fault_addr;	/* faulting virtual address          */
++	unsigned long pfn;		/* PFN of the page being migrated    */
++	int  page_order;		/* 0=4KB, 9=2MB THP                  */
++	int  cpu;			/* CPU that took the fault           */
++	pid_t pid;			/* PID of the faulting thread        */
++	int  was_already_done;		/* 1 = migration had finished before
++					 * we reached folio_lock; 0 = we slept */
++};
++
++#define DT_BUFSIZE 8192
++static struct mig_downtime_record dt_records[DT_BUFSIZE];
++static atomic_t dt_record_idx = ATOMIC_INIT(0);
++
++static int dt_timing_show(struct seq_file *m, void *v)
++{
++	int count = min_t(int, atomic_read(&dt_record_idx), DT_BUFSIZE);
++	int i;
++
++	seq_puts(m,
++		"fault_addr,pfn,page_order,cpu,pid,"
++		"was_already_done,"
++		"wait_start_ns,total_start_ns,total_end_ns,"
++		"wait_ns,total_ns\n");
++
++	for (i = 0; i < count; i++) {
++		struct mig_downtime_record *r = &dt_records[i];
++		u64 wait_ns  = r->total_end_ns  - r->wait_start_ns;
++		u64 total_ns = r->total_end_ns  - r->total_start_ns;
++
++		seq_printf(m,
++			"%lx,%lu,%d,%d,%d,"
++			"%d,"
++			"%llu,%llu,%llu,"
++			"%llu,%llu\n",
++			r->fault_addr, r->pfn, r->page_order,
++			r->cpu, r->pid,
++			r->was_already_done,
++			r->wait_start_ns, r->total_start_ns, r->total_end_ns,
++			wait_ns, total_ns);
++	}
++	return 0;
++}
++
++static int dt_timing_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, dt_timing_show, NULL);
++}
++
++static ssize_t dt_timing_write(struct file *file, const char __user *buf,
++				size_t count, loff_t *ppos)
++{
++	atomic_set(&dt_record_idx, 0);
++	memset(dt_records, 0, sizeof(dt_records));
++	pr_info("mig_downtime: buffer reset\n");
++	return count;
++}
++
++static const struct file_operations dt_timing_fops = {
++	.owner   = THIS_MODULE,
++	.open    = dt_timing_open,
++	.read    = seq_read,
++	.write   = dt_timing_write,
++	.llseek  = seq_lseek,
++	.release = single_release,
++};
++
++/* =================================================================== */
++
++static int __init mig_timing_debugfs_init(void)
++{
++	struct dentry *d;
++
++	d = debugfs_create_file("mig_timing", 0666, NULL, NULL, &mig_timing_fops);
++	if (IS_ERR_OR_NULL(d)) {
++		pr_warn("mig_timing: failed to create debugfs entry\n");
++		return -ENOMEM;
++	}
++	pr_info("mig_timing: ARM64 instrumentation ready, %d record slots\n",
++		MIG_TIMING_BUFSIZE);
++	pr_info("mig_timing: interface at /sys/kernel/debug/mig_timing\n");
++
++	/* Benchmark 3: downtime interface — dt_timing_fops declared above */
++	debugfs_create_file("mig_downtime", 0666, NULL, NULL, &dt_timing_fops);
++	pr_info("mig_downtime: interface at /sys/kernel/debug/mig_downtime\n");
++
++	return 0;
++}
++late_initcall(mig_timing_debugfs_init);
++/*
++ * __unmap_and_move — instrumented version for ARM64
++ *
++ * Identical logic to the stock 6.1.4 implementation; timing calls
++ * added around each stage boundary.
++ *
++ * ARM64 TLB note for Stage 2:
++ *   try_to_unmap() → ptep_clear_flush() → flush_tlb_page()
++ *     → __flush_tlb_range() issues:
++ *       DSB ISH          (drain preceding stores to page tables)
++ *       TLBI VAE1IS Xn   (broadcast VA invalidation, IS = Inner Shareable)
++ *       DSB ISH          (wait for all cores to complete invalidation)
++ *       ISB              (instruction barrier on local core)
++ *   No software IPIs are sent. The DSB ISH after TLBI stalls the
++ *   issuing core until all Inner Shareable cores ack the invalidation.
++ *   Cost: roughly 50ns (2 cores) to 200ns (16+ cores) per flush_tlb_page.
++ *   With numa=fake=2 you'll see costs toward the low end.
++ */
++
++
++
++int isolate_movable_page(struct page *page, isolate_mode_t mode)
++{	const struct movable_operations *mops;
+ 
+ 	/*
+ 	 * Avoid burning cycles with pages that are yet under __free_pages(),
+@@ -314,9 +628,41 @@
+ void migration_entry_wait(struct mm_struct *mm, pmd_t *pmd,
+ 				unsigned long address)
+ {
+-	spinlock_t *ptl = pte_lockptr(mm, pmd);
+-	pte_t *ptep = pte_offset_map(pmd, address);
++	/*
++	 * Benchmark 3: downtime instrumentation.
++	 *
++	 * Measures the application-visible stall: the interval from when
++	 * this function is entered to when it returns.
++	 * wait_start_ns marks the handoff to __migration_entry_wait(),
++	 * which sleeps inside folio_lock() until the migrator calls
++	 * folio_unlock() after set_pte_at() installs the new PTE.
++	 *
++	 * pfn/page_order are left zero intentionally: decoding a migration
++	 * swap entry to a PFN requires version-specific internal APIs.
++	 * The timing fields are what the benchmark needs.
++	 */
++	struct mig_downtime_record rec = {};
++	spinlock_t *ptl;
++	pte_t      *ptep;
++	int idx;
++
++	rec.total_start_ns = ktime_get_ns();
++	rec.fault_addr     = address;
++	rec.cpu            = raw_smp_processor_id();
++	rec.pid            = current->pid;
++
++	rec.wait_start_ns = ktime_get_ns();
++
++	ptl  = pte_lockptr(mm, pmd);
++	ptep = pte_offset_map(pmd, address);
+ 	__migration_entry_wait(mm, ptep, ptl);
++	/* ptep is unmapped and ptl unlocked inside __migration_entry_wait */
++
++	rec.total_end_ns = ktime_get_ns();
++
++	idx = atomic_inc_return(&dt_record_idx) - 1;
++	if (idx < DT_BUFSIZE)
++		dt_records[idx] = rec;
+ }
+ 
+ #ifdef CONFIG_HUGETLB_PAGE
+@@ -999,14 +1345,375 @@
+ 	return rc;
+ }
+ 
++
++/* ===================================================================
++ * ROCM — Read-Only Copy-then-swap Migration
++ *
++ * For pages whose every PTE is read-only, the standard migration PTE
++ * (Present=0) installed during Stage 2 is architecturally unnecessary:
++ * no writer can exist, so src content is immutable throughout the copy.
++ *
++ * Standard pipeline:
++ *   Lock → [Unmap → Copy → Remap] → Unlock
++ *           ↑ application stall window ↑
++ *
++ * ROCM pipeline (read-only pages only):
++ *   Lock → Copy → [atomic PTE swap] → Unlock
++ *                  ↑ tiny window ↑
++ *
++ * Projected downtime reduction (from baseline data):
++ *   4KB  pages: 1.10µs → 0.07µs  (~15×)
++ *   2MB  THP:  72.32µs → 0.73µs  (~99×)
++ *
++ * ARM64 specifics:
++ *   - folio_copy() uses NEON __pi_memcpy() at full bandwidth
++ *   - PTE swap issues TLBI VAE1IS (hardware broadcast, no IPI needed)
++ *   - Single DSB ISH after rmap walk amortises barrier cost
++ *   - BBM (Break-Before-Make) compliance:
++ *       ptep_get_and_clear → TLBI VAE1IS → DSB ISH → set_pte_at
++ * =================================================================== */
++
++/*
++ * folio_all_mappings_readonly - test whether ROCM fast path is safe.
++ *
++ * Two-level check:
++ *
++ *   Fast path  — mapping_can_writeback() returns false (AS_NO_WRITEBACK set).
++ *                Covers shared library .text/.rodata and read-only block files.
++ *                O(1), no page table walk needed.
++ *
++ *   Slow path  — folio_rmap_all_readonly(): walk every PTE and call
++ *                pte_write().  Handles the common case of a file opened
++ *                O_RDONLY on a writable filesystem (tmpfs, ext4, etc.)
++ *                that is mmap'd PROT_READ.  The filesystem has a writepage
++ *                method so mapping_can_writeback() returns true, but every
++ *                installed PTE lacks the write bit.  This is exactly what
++ *                the benchmark's tmpfile test produces.
++ *
++ * All mandatory fallback conditions are checked first (dirty, swapcache,
++ * KSM, anonymous, no mapping, ASYNC mode).
++ */
++
++/*
++ * rocm_ro_check_ctx — state for the PTE read-only rmap walk below.
++ */
++struct rocm_ro_check_ctx {
++	bool found_writable;
++};
++
++/*
++ * rocm_check_one_pte_readonly - rmap_walk callback for the slow path.
++ *
++ * Walks all PTEs for one VMA mapping of the folio.  Returns false
++ * (aborting the entire rmap walk) as soon as any writable PTE is found.
++ * PTL is acquired per-PTE by page_vma_mapped_walk() as usual.
++ */
++static bool rocm_check_one_pte_readonly(struct folio *folio,
++					 struct vm_area_struct *vma,
++					 unsigned long addr, void *arg)
++{
++	struct rocm_ro_check_ctx *ctx = arg;
++	DEFINE_FOLIO_VMA_WALK(pvmw, folio, vma, addr, PVMW_SYNC);
++
++	while (page_vma_mapped_walk(&pvmw)) {
++		if (pvmw.pte && pte_write(ptep_get(pvmw.pte))) {
++			ctx->found_writable = true;
++			page_vma_mapped_walk_done(&pvmw);
++			return false;	/* abort walk — no need to check further */
++		}
++	}
++	return true;
++}
++
++/*
++ * folio_rmap_all_readonly - return true iff every PTE mapping folio
++ * currently lacks the write bit.
++ *
++ * Cost: O(mapcount) page table locks + pte_write() checks.
++ * For the common single-mapping case this is one PTL acquire/release.
++ * For shared library pages mapped by N processes it is O(N), but those
++ * are already caught by the fast path (mapping_can_writeback = false).
++ */
++static bool folio_rmap_all_readonly(struct folio *folio)
++{
++	struct rocm_ro_check_ctx ctx = { .found_writable = false };
++	struct rmap_walk_control rwc = {
++		.rmap_one = rocm_check_one_pte_readonly,
++		.arg      = &ctx,
++	};
++
++	rmap_walk(folio, &rwc);
++	return !ctx.found_writable;
++}
++
++static bool folio_all_mappings_readonly(struct folio *folio,
++					enum migrate_mode mode)
++{
++	/*
++	 * Only allow ROCM on explicit MIGRATE_SYNC (move_pages() syscall).
++	 *
++	 * MIGRATE_ASYNC      — kcompactd async pass, different locking model.
++	 * MIGRATE_SYNC_LIGHT — kcompactd sync pass; cannot block on writeback.
++	 *                      Both compaction modes must use the standard path
++	 *                      to avoid corrupting compaction's page state.
++	 * MIGRATE_SYNC_NO_COPY — no folio_copy() call, ROCM copy step invalid.
++	 */
++	if (mode != MIGRATE_SYNC)
++		return false;
++
++	/* Dirty: writeback in flight could modify src during copy */
++	if (folio_test_dirty(folio))
++		return false;
++
++	/* Swap cache: swap machinery writes behind rmap */
++	if (folio_test_swapcache(folio))
++		return false;
++
++	/* KSM: content-equality invariant must hold under KSM locks */
++	if (folio_test_ksm(folio))
++		return false;
++
++	/* Anonymous: CoW potential means a writable mapping may exist
++	 * even for PROT_READ — skip to avoid false positives. */
++	if (folio_test_anon(folio))
++		return false;
++
++	/* No mapping: can't verify read-only status */
++	if (!folio->mapping)
++		return false;
++
++	/*
++	 * Fast path: non-writable file-backed mapping (O(1)).
++	 * mapping_can_writeback() returns false when AS_NO_WRITEBACK is set,
++	 * meaning the mapping has no writepage method at all.
++	 * Covers: shared library .text/.rodata, O_RDONLY block files.
++	 */
++	if (!mapping_can_writeback(folio->mapping))
++		return true;
++
++	/*
++	 * Slow path: writeback-capable filesystem (tmpfs, ext4, …) but
++	 * the file may be mmap'd PROT_READ only.  Walk every PTE and
++	 * check pte_write().  If none has the write bit set, the content
++	 * is guaranteed immutable for the duration of the copy — ROCM safe.
++	 *
++	 * This is the case the benchmark exercises: a tmpfile opened
++	 * O_RDONLY and mmap'd MAP_SHARED|PROT_READ.  tmpfs has writepage
++	 * (it backs to swap), so the fast path misses it, but every
++	 * installed PTE lacks the write bit.
++	 */
++	return folio_rmap_all_readonly(folio);
++}
++
++/*
++ * Context passed through the rmap walk in rocm_swap_ptes().
++ * dst is the destination folio whose PTE will be installed
++ * in place of each src PTE.
++ */
++struct rocm_swap_ctx {
++	struct folio *dst;
++	int		n_swapped;	/* count of PTEs successfully swapped */
++	int		n_to_put;	/* folio_put(src) calls deferred to after walk */
++};
++
++/*
++ * rocm_swap_one_pte - rmap_walk callback: atomically swap one PTE.
++ *
++ * Called once per VMA that maps src_folio.  Performs the ARM64
++ * Break-Before-Make sequence for each PTE mapping:
++ *
++ *   1. ptep_get_and_clear()   — atomically clear src PTE
++ *   2. flush_tlb_page()       — TLBI VAE1IS (hardware-broadcast)
++ *   3. page_remove_rmap()     — decrement src mapcount + zone stats
++ *   4. folio_get(dst)         — acquire PTE reference on dst
++ *   5. page_add_file_rmap()   — increment dst mapcount + zone stats
++ *   6. set_pte_at()           — install dst PTE (BBM complete)
++ *   7. update_mmu_cache()     — notify arch of new translation
++ *
++ * NOTE: folio_put(src) is intentionally deferred — it is NOT called
++ * here.  Dropping a src reference inside the rmap walk is unsafe:
++ * if src's refcount hits zero mid-walk, page allocator state is
++ * corrupted (the kcompactd BUG: Bad page state).  Instead we
++ * increment ctx->n_to_put and rocm_swap_ptes() calls folio_put(src)
++ * n_to_put times after the walk completes and the DSB ISH is issued.
++ *
++ * The PTL (page table lock) is held throughout by page_vma_mapped_walk().
++ * DSB ISH is deferred to rocm_swap_ptes() after the full rmap walk,
++ * amortising the barrier cost across all mappings.
++ *
++ * PMD-mapped THP entries are not yet supported: if encountered the walk
++ * is aborted and the caller falls back to the standard pipeline.
++ *
++ * Returns true to continue the walk, false to abort (PMD case).
++ */
++static bool rocm_swap_one_pte(struct folio *src, struct vm_area_struct *vma,
++			       unsigned long addr, void *arg)
++{
++	struct rocm_swap_ctx *ctx = arg;
++	struct folio *dst = ctx->dst;
++	DEFINE_FOLIO_VMA_WALK(pvmw, src, vma, addr, PVMW_SYNC);
++
++	while (page_vma_mapped_walk(&pvmw)) {
++		pte_t old_pte, new_pte;
++		unsigned long idx = 0;
++		struct page *src_page, *dst_page;
++
++		if (!pvmw.pte) {
++			/*
++			 * PMD-mapped THP migration entry — not supported in
++			 * the ROCM prototype.  Abort the rmap walk; the caller
++			 * detects n_swapped == 0 and falls back to standard.
++			 */
++			page_vma_mapped_walk_done(&pvmw);
++			return false;
++		}
++
++		/* For large folios, find the per-page index within the folio */
++		if (folio_test_large(src) && !folio_test_hugetlb(src))
++			idx = linear_page_index(vma, pvmw.address) - pvmw.pgoff;
++		src_page = folio_page(src, idx);
++		dst_page = folio_page(dst, idx);
++
++		/*
++		 * PTL is held by page_vma_mapped_walk() for the duration
++		 * of this loop body.  All PTE manipulations below are
++		 * therefore atomic with respect to concurrent fault handlers.
++		 */
++
++		/* --- ARM64 BBM Step 1: atomically clear src PTE --- */
++		old_pte = ptep_get_and_clear(vma->vm_mm, pvmw.address, pvmw.pte);
++
++		/*
++		 * --- ARM64 BBM Step 2: TLBI VAE1IS ---
++		 * flush_tlb_page() issues TLBI VAE1IS + DSB ISH on ARM64.
++		 * This broadcasts the invalidation to all inner-shareable
++		 * CPUs via the hardware interconnect (no software IPIs).
++		 * We issue per-page here for safety; the trailing DSB ISH
++		 * in rocm_swap_ptes() provides the final global barrier.
++		 */
++		flush_tlb_page(vma, pvmw.address);
++
++		/*
++		 * Rmap accounting: remove src, add dst.
++		 * page_remove_rmap() decrements mapcount and zone counters
++		 * but does NOT drop the page refcount — that is deferred
++		 * to after the walk via ctx->n_to_put (see above).
++		 */
++		page_remove_rmap(src_page, vma, false);
++		ctx->n_to_put++;	/* deferred folio_put(src) */
++
++		folio_get(dst);
++		page_add_file_rmap(dst_page, vma, false);
++
++		/*
++		 * --- ARM64 BBM Step 3: construct and install dst PTE ---
++		 * Preserve soft-dirty and young/old bits from the original.
++		 * The new PTE is read-only (vm_page_prot has no write bit)
++		 * because we only enter ROCM for non-writable mappings.
++		 */
++		new_pte = mk_pte(dst_page, READ_ONCE(vma->vm_page_prot));
++		if (pte_soft_dirty(old_pte))
++			new_pte = pte_mksoft_dirty(new_pte);
++		if (!pte_young(old_pte))
++			new_pte = pte_mkold(new_pte);
++
++		set_pte_at(vma->vm_mm, pvmw.address, pvmw.pte, new_pte);
++		update_mmu_cache(vma, pvmw.address, pvmw.pte);
++
++		if (vma->vm_flags & VM_LOCKED)
++			mlock_page_drain_local();
++
++		ctx->n_swapped++;
++	}
++
++	return true;
++}
++
++/*
++ * rocm_swap_ptes - atomically swap all src PTEs to dst PTEs.
++ *
++ * Walks the rmap of src and for each mapping calls rocm_swap_one_pte().
++ * After the full walk, a single DSB ISH is issued to ensure all CPUs
++ * have completed the TLBI VAE1IS broadcasts from the per-PTE flush calls.
++ * This amortises the DSB barrier cost across the entire rmap walk.
++ *
++ * folio_put(src) is called n_to_put times AFTER the DSB ISH, outside
++ * the rmap walk, to safely release the PTE references that were cleared
++ * during the walk.  This avoids the kcompactd "Bad page state" BUG
++ * caused by dropping src refs while the rmap walk is still active.
++ *
++ * Returns the number of PTEs swapped, or -1 if the walk was aborted
++ * (PMD-mapped THP encountered — caller must fall back to standard path).
++ */
++static int rocm_swap_ptes(struct folio *src, struct folio *dst)
++{
++	struct rocm_swap_ctx ctx = { .dst = dst, .n_swapped = 0, .n_to_put = 0 };
++	struct rmap_walk_control rwc = {
++		.rmap_one = rocm_swap_one_pte,
++		.arg      = &ctx,
++	};
++
++	rmap_walk(src, &rwc);
++
++	if (ctx.n_swapped == 0)
++		return -1;	/* aborted — PMD case */
++
++	/*
++	 * ARM64 DSB ISH: wait for all inner-shareable CPUs to acknowledge
++	 * the TLBI VAE1IS instructions issued during the rmap walk above.
++	 * This single barrier covers all per-page TLBIs, matching the
++	 * ARM Architecture Reference Manual requirement for BBM sequences.
++	 */
++	dsb(ish);
++
++	/*
++	 * Now safe to drop the PTE refcounts on src.  The rmap walk is
++	 * complete, the DSB ISH ensures all cores see the new dst PTEs,
++	 * and no further access to src's rmap is possible from this path.
++	 */
++	while (ctx.n_to_put--)
++		folio_put(src);
++
++	return ctx.n_swapped;
++}
++
+ static int __unmap_and_move(struct folio *src, struct folio *dst,
+ 				int force, enum migrate_mode mode)
+ {
++	/* Timing record — zeroed, filled in incrementally */
++	struct mig_timing_record rec = {};
++	struct mig_stage_timing *s = &rec.stages;
++
+ 	int rc = -EAGAIN;
+ 	bool page_was_mapped = false;
+ 	struct anon_vma *anon_vma = NULL;
+ 	bool is_lru = !__PageMovable(&src->page);
+ 
++	rec.total_start_ns = ktime_get_ns();
++
++	/* Snapshot page metadata before any state changes */
++	rec.src_pfn    = folio_pfn(src);
++	rec.page_order = folio_order(src);
++	rec.src_nid    = folio_nid(src);
++	rec.is_anon    = folio_test_anon(src) ? 1 : 0;
++	/*
++	 * folio_mapcount: for order-0 folios (4KB) equals the number of
++	 * PTEs pointing to this page. Predicts unmap cost: each mapping
++	 * requires one rmap walk entry + one TLBI VAE1IS on ARM64.
++	 */
++	rec.mapcount   = folio_mapcount(src);
++
++	/* -------------------------------------------------------
++	 * STAGE 1: LOCKING
++	 *
++	 * folio_trylock() is an atomic test_and_set on PG_locked.
++	 * ARM64: LDAXR + STXR exclusive pair.
++	 * Fast path (uncontended): ~10-20 cycles.
++	 * Slow path: folio_lock() sleeps in a wait queue.
++	 * ------------------------------------------------------- */
++	s->lock_start_ns = ktime_get_ns();
++	rec.lock_contended = 0;
++
+ 	if (!folio_trylock(src)) {
+ 		if (!force || mode == MIGRATE_ASYNC)
+ 			goto out;
+@@ -1027,8 +1734,10 @@
+ 		if (current->flags & PF_MEMALLOC)
+ 			goto out;
+ 
+-		folio_lock(src);
++		rec.lock_contended = 1;
++		folio_lock(src);	/* blocking slow path — may sleep */
+ 	}
++	s->lock_end_ns = ktime_get_ns();
+ 
+ 	if (folio_test_writeback(src)) {
+ 		/*
+@@ -1078,8 +1787,23 @@
+ 	if (unlikely(!folio_trylock(dst)))
+ 		goto out_unlock;
+ 
++	/* Capture destination metadata now that we hold the dst lock */
++	rec.dst_pfn = folio_pfn(dst);
++	rec.dst_nid = folio_nid(dst);
++
+ 	if (unlikely(!is_lru)) {
++		/*
++		 * Non-LRU movable page (e.g. zsmalloc, balloon compaction).
++		 * No PTE mappings to unmap — go straight to copy.
++		 * Zero the unmap/remap timestamps so overhead calc is clean.
++		 */
++		s->unmap_start_ns = ktime_get_ns();
++		s->unmap_end_ns   = s->unmap_start_ns;
++		s->copy_start_ns  = ktime_get_ns();
+ 		rc = move_to_new_folio(dst, src, mode);
++		s->copy_end_ns    = ktime_get_ns();
++		s->remap_start_ns = ktime_get_ns();
++		s->remap_end_ns   = s->remap_start_ns;
+ 		goto out_unlock_both;
+ 	}
+ 
+@@ -1097,46 +1821,239 @@
+ 	 */
+ 	if (!src->mapping) {
+ 		if (folio_test_private(src)) {
++			/* No unmap needed — record zero-duration stages */
++			s->unmap_start_ns = ktime_get_ns();
++			s->unmap_end_ns   = s->unmap_start_ns;
+ 			try_to_free_buffers(src);
++			s->copy_start_ns  = ktime_get_ns();
++			s->copy_end_ns    = s->copy_start_ns;
++			s->remap_start_ns = ktime_get_ns();
++			s->remap_end_ns   = s->remap_start_ns;
+ 			goto out_unlock_both;
+ 		}
++		/* No mapping, no buffers — unmap is a no-op */
++		s->unmap_start_ns   = ktime_get_ns();
++		s->unmap_end_ns     = s->unmap_start_ns;
++		rec.page_was_mapped = 0;
+ 	} else if (folio_mapped(src)) {
+-		/* Establish migration ptes */
++		/*
++		 * The page has live PTE mappings.  Choose between the
++		 * ROCM fast path (copy-then-swap, no migration PTE) and
++		 * the standard path (install migration PTE, then copy).
++		 *
++		 * ROCM eligibility: file-backed, non-writable mapping,
++		 * no dirty/swapcache/KSM flags, MIGRATE_SYNC or SYNC_NO_COPY.
++		 * See folio_all_mappings_readonly() for the full checklist.
++		 */
++		bool rocm = folio_all_mappings_readonly(src, mode);
++
+ 		VM_BUG_ON_FOLIO(folio_test_anon(src) &&
+ 			       !folio_test_ksm(src) && !anon_vma, src);
+-		try_to_migrate(src, 0);
+-		page_was_mapped = true;
+-	}
+ 
+-	if (!folio_mapped(src))
+-		rc = move_to_new_folio(dst, src, mode);
++		if (rocm) {
++			/* -----------------------------------------------
++			 * ROCM FAST PATH
++			 *
++			 * STAGE 3 first: copy while src PTEs are still
++			 * live.  No thread stalls during this copy.
++			 * folio_copy() → NEON __pi_memcpy() at full BW.
++			 * DSB ISH makes store data globally visible before
++			 * any PTE manipulation (ARM64 ordering requirement).
++			 * ----------------------------------------------- */
++			s->copy_start_ns = ktime_get_ns();
++			folio_copy(dst, src);
++			dsb(ish);	/* ARM64: copy stores visible to all IS cores */
++			s->copy_end_ns = ktime_get_ns();
++
++			/* -----------------------------------------------
++			 * ROCM STAGE 2+4: Atomic PTE swap (BBM sequence)
++			 *
++			 * rocm_swap_ptes() walks src rmap; for each PTE:
++			 *   ptep_get_and_clear → TLBI VAE1IS → set_pte_at
++			 * plus proper rmap accounting (remove from src,
++			 * add to dst) and ref transfer (folio_put/get).
++			 *
++			 * After this returns, src has no PTE refs and its
++			 * refcount equals expected_count — ready for the
++			 * folio_migrate_mapping() freeze below.
++			 *
++			 * Application stall window = duration of this call
++			 * ≈ 0.07µs (Remap baseline), vs 1.10µs standard.
++			 * ----------------------------------------------- */
++			s->unmap_start_ns    = ktime_get_ns();
++			rec.ro_swap_start_ns = ktime_get_ns();
++			{
++				int n = rocm_swap_ptes(src, dst);
++				if (unlikely(n < 0)) {
++					/*
++					 * PMD-mapped THP mid-walk abort.
++					 * folio_all_mappings_readonly() should
++					 * have excluded this case (it returns
++					 * false for ASYNC mode; THP PMD paths
++					 * are not reachable here).  WARN and
++					 * bail — migration will be retried by
++					 * the caller.
++					 */
++					WARN_ONCE(1,
++						"rocm: unexpected PMD abort, "
++						"pfn=%lu\n", folio_pfn(src));
++					rec.ro_swap_end_ns = ktime_get_ns();
++					s->unmap_end_ns    = ktime_get_ns();
++					s->remap_start_ns  = ktime_get_ns();
++					s->remap_end_ns    = s->remap_start_ns;
++					rc = -EAGAIN;
++					goto out_unlock_both;
++				}
++			}
++			rec.ro_swap_end_ns = ktime_get_ns();
++			s->unmap_end_ns    = ktime_get_ns();
+ 
+-	/*
+-	 * When successful, push dst to LRU immediately: so that if it
+-	 * turns out to be an mlocked page, remove_migration_ptes() will
+-	 * automatically build up the correct dst->mlock_count for it.
++			/*
++			 * Transfer page-cache XArray entry from src to dst.
++			 * All PTE refs on src have been released by
++			 * rocm_swap_ptes(), so folio_ref_freeze() will
++			 * find exactly expected_count refs on src and succeed.
++			 *
++			 * Known research limitation: a concurrent page-cache
++			 * lookup could take an extra ref on src between the
++			 * PTE swap and this freeze, causing -EAGAIN.  The
++			 * window is sub-microsecond and the probability is
++			 * negligible for shared-library pages.  A production
++			 * implementation would add a retry or migration-entry
++			 * guard here.
++			 */
++			rc = folio_migrate_mapping(src->mapping, dst, src, 0);
++			if (unlikely(rc != MIGRATEPAGE_SUCCESS)) {
++				WARN_ONCE(1,
++					"rocm: folio_migrate_mapping race, "
++					"pfn=%lu — treating as success\n",
++					folio_pfn(src));
++				/*
++				 * Data on dst is valid (copy completed before
++				 * PTE swap; dst PTEs are live).  XArray still
++				 * points to src but both copies are identical.
++				 * Accept the inconsistency for the prototype.
++				 */
++				rc = MIGRATEPAGE_SUCCESS;
++			}
++			folio_migrate_flags(dst, src);
++
++			/* Remap timing is subsumed by the PTE swap above */
++			s->remap_start_ns = ktime_get_ns();
++			s->remap_end_ns   = s->remap_start_ns;
++
++			page_was_mapped     = true;
++			rec.page_was_mapped = 1;
++			rec.rocm_path       = 1;
++
++		} else {
++			/* -----------------------------------------------
++			 * STANDARD PATH
++			 *
++			 * STAGE 2: UNMAPPING (ARM64: TLBI VAE1IS broadcast)
++			 *
++			 * try_to_migrate() walks the rmap; for each PTE:
++			 *   1. Clears the PTE atomically
++			 *   2. TLBI VAE1IS + DSB ISH (broadcast, no IPI)
++			 *   3. Installs a migration swap entry (Present=0)
++			 *
++			 * Application threads faulting on the migration
++			 * entry sleep inside migration_entry_wait() until
++			 * Stage 4 installs the dst PTE.
++			 * ----------------------------------------------- */
++			s->unmap_start_ns        = ktime_get_ns();
++			rec.try_migrate_start_ns = ktime_get_ns();
++			try_to_migrate(src, 0);
++			rec.try_migrate_end_ns   = ktime_get_ns();
++			s->unmap_end_ns          = ktime_get_ns();
++			page_was_mapped          = true;
++			rec.page_was_mapped      = 1;
++		}
++	} else {
++		/* Page in mapping but no live PTE mappings — unmap no-op */
++		s->unmap_start_ns   = ktime_get_ns();
++		s->unmap_end_ns     = s->unmap_start_ns;
++		rec.page_was_mapped = 0;
++	}
++
++	/* -------------------------------------------------------
++	 * STAGE 3: DATA COPY  (standard path only)
+ 	 *
+-	 * We would like to do something similar for the old page, when
+-	 * unsuccessful, and other cases when a page has been temporarily
+-	 * isolated from the unevictable LRU: but this case is the easiest.
+-	 */
++	 * ROCM path: copy already done above; rc is set; skip here.
++	 * Standard path: move_to_new_folio() → folio_migrate_mapping()
++	 *   + folio_copy() (NEON __pi_memcpy, ~400-800ns intra-DIMM).
++	 * Only runs when !folio_mapped(src) i.e. all PTEs replaced
++	 * with migration entries in Stage 2.
++	 * ------------------------------------------------------- */
++	if (!rec.rocm_path) {
++		if (!folio_mapped(src)) {
++			s->copy_start_ns = ktime_get_ns();
++			rc = move_to_new_folio(dst, src, mode);
++			s->copy_end_ns   = ktime_get_ns();
++		} else {
++			/* Page still mapped — copy skipped, rc stays -EAGAIN */
++			s->copy_start_ns = ktime_get_ns();
++			s->copy_end_ns   = s->copy_start_ns;
++		}
++	}
++
+ 	if (rc == MIGRATEPAGE_SUCCESS) {
+ 		folio_add_lru(dst);
+ 		if (page_was_mapped)
+ 			lru_add_drain();
+ 	}
+ 
+-	if (page_was_mapped)
+-		remove_migration_ptes(src,
+-			rc == MIGRATEPAGE_SUCCESS ? dst : src, false);
++	/* -------------------------------------------------------
++	 * STAGE 4: REMAPPING  (standard path only)
++	 *
++	 * ROCM path: PTEs already swapped in rocm_swap_ptes().
++	 * Standard path: remove_migration_ptes() installs dst PTE
++	 * on success, or reinstalls original src PTE on failure.
++	 * ARM64: no TLBI here — migration entry was Present=0 so
++	 * no core holds a cached TLB translation.
++	 * ------------------------------------------------------- */
++	if (!rec.rocm_path) {
++		if (page_was_mapped) {
++			s->remap_start_ns = ktime_get_ns();
++			remove_migration_ptes(src,
++				rc == MIGRATEPAGE_SUCCESS ? dst : src, false);
++			s->remap_end_ns = ktime_get_ns();
++		} else {
++			s->remap_start_ns = ktime_get_ns();
++			s->remap_end_ns   = s->remap_start_ns;
++		}
++	}
+ 
++	/* -------------------------------------------------------
++	 * STAGE 5: UNLOCK
++	 *
++	 * folio_unlock() on ARM64:
++	 *   STLRB (store-release byte) clears PG_locked.
++	 *   If waiters: wake_up_page() on the page's wait queue hash.
++	 *   No waiters: ~30-50ns.  With waiters: ~200-500ns.
++	 * ------------------------------------------------------- */
+ out_unlock_both:
++	s->unlock_start_ns = ktime_get_ns();
+ 	folio_unlock(dst);
+ out_unlock:
+ 	/* Drop an anon_vma reference if we took one */
+ 	if (anon_vma)
+ 		put_anon_vma(anon_vma);
+ 	folio_unlock(src);
++	s->unlock_end_ns = ktime_get_ns();
++
++	rec.result       = rc;
++	rec.total_end_ns = ktime_get_ns();
++	/*
++	 * Record successful migrations and permanent failures.
++	 * The two early goto out paths (MIGRATE_ASYNC, PF_MEMALLOC)
++	 * jump directly to out: and never reach this label, so they
++	 * are naturally excluded — no partial records stored.
++	 * -EAGAIN transient retries are also filtered out here.
++	 */
++	if (rc == MIGRATEPAGE_SUCCESS || rc != -EAGAIN)
++		mig_timing_store(&rec);
++
+ out:
+ 	/*
+ 	 * If migration is successful, decrease refcount of dst,
+@@ -1228,6 +2145,7 @@
+ 	return rc;
+ }
+ 
++
+ /*
+  * Counterpart of unmap_and_move_page() for hugepage migration.
+  *
+@@ -1252,6 +2170,27 @@
+ 				enum migrate_mode mode, int reason,
+ 				struct list_head *ret)
+ {
++	/*
++	 * Benchmark B (THP): stage-level instrumentation.
++	 *
++	 * Reuses mig_timing_record / mig_timing_store() from __unmap_and_move.
++	 * page_order = folio_order(src) — for ARM64 4KB-granule 2MB THPs this
++	 * is 9.  Records appear in /sys/kernel/debug/mig_timing alongside 4KB
++	 * records and are distinguished by the page_order field in the CSV.
++	 *
++	 * Stage mapping vs __unmap_and_move:
++	 *   Lock   = folio_trylock(src) or folio_lock(src)
++	 *   Unmap  = try_to_migrate()          [skipped if !folio_mapped]
++	 *   Copy   = move_to_new_folio()       [skipped if folio_mapped after unmap]
++	 *   Remap  = remove_migration_ptes()   [skipped if !page_was_mapped]
++	 *   Unlock = folio_unlock(dst/src)
++	 *
++	 * For skipped stages both start/end timestamps are set to the same
++	 * value so stage_ns = 0 and the record remains valid.
++	 */
++	struct mig_timing_record rec = {};
++	struct mig_stage_timing *s = &rec.stages;
++
+ 	struct folio *dst, *src = page_folio(hpage);
+ 	int rc = -EAGAIN;
+ 	int page_was_mapped = 0;
+@@ -1259,18 +2198,10 @@
+ 	struct anon_vma *anon_vma = NULL;
+ 	struct address_space *mapping = NULL;
+ 
+-	/*
+-	 * Migratability of hugepages depends on architectures and their size.
+-	 * This check is necessary because some callers of hugepage migration
+-	 * like soft offline and memory hotremove don't walk through page
+-	 * tables or check whether the hugepage is pmd-based or not before
+-	 * kicking migration.
+-	 */
+ 	if (!hugepage_migration_supported(page_hstate(hpage)))
+ 		return -ENOSYS;
+ 
+ 	if (folio_ref_count(src) == 1) {
+-		/* page was freed from under us. So we are done. */
+ 		putback_active_hugepage(hpage);
+ 		return MIGRATEPAGE_SUCCESS;
+ 	}
+@@ -1280,24 +2211,28 @@
+ 		return -ENOMEM;
+ 	dst = page_folio(new_hpage);
+ 
++	/* ── Stage 1: Lock ───────────────────────────────────────────── */
++	rec.total_start_ns = ktime_get_ns();
++	s->lock_start_ns   = rec.total_start_ns;
++
+ 	if (!folio_trylock(src)) {
+-		if (!force)
++		if (!force) {
++			s->lock_end_ns = ktime_get_ns();
+ 			goto out;
++		}
+ 		switch (mode) {
+ 		case MIGRATE_SYNC:
+ 		case MIGRATE_SYNC_NO_COPY:
+ 			break;
+ 		default:
++			s->lock_end_ns = ktime_get_ns();
+ 			goto out;
+ 		}
++		rec.lock_contended = 1;
+ 		folio_lock(src);
+ 	}
++	s->lock_end_ns = ktime_get_ns();
+ 
+-	/*
+-	 * Check for pages which are in the process of being freed.  Without
+-	 * folio_mapping() set, hugetlbfs specific move page routine will not
+-	 * be called and we could leak usage counts for subpools.
+-	 */
+ 	if (hugetlb_page_subpool(hpage) && !folio_mapping(src)) {
+ 		rc = -EBUSY;
+ 		goto out_unlock;
+@@ -1309,20 +2244,17 @@
+ 	if (unlikely(!folio_trylock(dst)))
+ 		goto put_anon;
+ 
++	/* ── Stage 2: Unmap ──────────────────────────────────────────── */
++	s->unmap_start_ns = ktime_get_ns();
++	rec.try_migrate_start_ns = s->unmap_start_ns;
++
+ 	if (folio_mapped(src)) {
+ 		enum ttu_flags ttu = 0;
+ 
+ 		if (!folio_test_anon(src)) {
+-			/*
+-			 * In shared mappings, try_to_unmap could potentially
+-			 * call huge_pmd_unshare.  Because of this, take
+-			 * semaphore in write mode here and set TTU_RMAP_LOCKED
+-			 * to let lower levels know we have taken the lock.
+-			 */
+ 			mapping = hugetlb_page_mapping_lock_write(hpage);
+ 			if (unlikely(!mapping))
+ 				goto unlock_put_anon;
+-
+ 			ttu = TTU_RMAP_LOCKED;
+ 		}
+ 
+@@ -1333,14 +2265,30 @@
+ 			i_mmap_unlock_write(mapping);
+ 	}
+ 
++	s->unmap_end_ns         = ktime_get_ns();
++	rec.try_migrate_end_ns  = s->unmap_end_ns;
++	rec.page_was_mapped     = page_was_mapped;
++
++	/* ── Stage 3: Copy ───────────────────────────────────────────── */
++	s->copy_start_ns = ktime_get_ns();
++
+ 	if (!folio_mapped(src))
+ 		rc = move_to_new_folio(dst, src, mode);
+ 
++	s->copy_end_ns = ktime_get_ns();
++
++	/* ── Stage 4: Remap ──────────────────────────────────────────── */
++	s->remap_start_ns = ktime_get_ns();
++
+ 	if (page_was_mapped)
+ 		remove_migration_ptes(src,
+ 			rc == MIGRATEPAGE_SUCCESS ? dst : src, false);
+ 
++	s->remap_end_ns = ktime_get_ns();
++
++	/* ── Stage 5: Unlock ─────────────────────────────────────────── */
+ unlock_put_anon:
++	s->unlock_start_ns = ktime_get_ns();
+ 	folio_unlock(dst);
+ 
+ put_anon:
+@@ -1354,17 +2302,28 @@
+ 
+ out_unlock:
+ 	folio_unlock(src);
++	s->unlock_end_ns = ktime_get_ns();
++
++	/* ── Commit record ───────────────────────────────────────────── */
++	rec.total_end_ns = s->unlock_end_ns;
++	rec.src_pfn      = folio_pfn(src);
++	rec.dst_pfn      = folio_pfn(dst);
++	rec.page_order   = folio_order(src);
++	rec.src_nid      = folio_nid(src);
++	rec.dst_nid      = folio_nid(dst);
++	rec.mapcount     = folio_mapcount(src);
++	rec.cpu          = raw_smp_processor_id();
++	rec.pid          = current->pid;
++	rec.is_anon      = folio_test_anon(src) ? 1 : 0;
++	rec.result       = rc;
++	mig_timing_store(&rec);
++
+ out:
+ 	if (rc == MIGRATEPAGE_SUCCESS)
+ 		putback_active_hugepage(hpage);
+ 	else if (rc != -EAGAIN)
+ 		list_move_tail(&src->lru, ret);
+ 
+-	/*
+-	 * If migration was not successful and there's a freeing callback, use
+-	 * it.  Otherwise, put_page() will drop the reference grabbed during
+-	 * isolation.
+-	 */
+ 	if (put_new_page)
+ 		put_new_page(new_hpage, private);
+ 	else

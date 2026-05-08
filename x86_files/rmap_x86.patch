@@ -1,0 +1,253 @@
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -52,6 +52,7 @@
+  *         page->flags PG_locked (lock_page)
+  */
+ 
++#include <linux/ktime.h>
+ #include <linux/mm.h>
+ #include <linux/sched/mm.h>
+ #include <linux/sched/task.h>
+@@ -83,6 +84,30 @@
+ 
+ #include "internal.h"
+ 
++/* ===================================================================
++ * Per-CPU rmap sub-timing — NUMA migration unmap decomposition (x86_64)
++ *
++ * Accumulated during try_to_migrate() for one folio.
++ * __unmap_and_move() (migrate_x86_unmap.c) reads and zeroes this
++ * immediately after try_to_migrate() returns, preemption disabled.
++ *
++ *  rwsem_ns  time blocked on anon_vma->rwsem read-lock (H3)
++ *  ptl_ns    PTE-body hold time from walk-true to body-end (H2 proxy)
++ *  ipi_ns    time inside ptep_clear_flush() incl. IPI roundtrip (H1)
++ * =================================================================== */
++#define CONFIG_MIG_RMAP_TIMING 1  /* set to 0 to compile out all overhead */
++
++#ifdef CONFIG_MIG_RMAP_TIMING
++struct mig_rmap_timing {
++	u64 rwsem_ns;
++	u64 ptl_ns;
++	u64 ipi_ns;
++};
++DEFINE_PER_CPU(struct mig_rmap_timing, mig_rmap_timing);
++EXPORT_SYMBOL_GPL(mig_rmap_timing);
++#endif /* CONFIG_MIG_RMAP_TIMING */
++
++
+ static struct kmem_cache *anon_vma_cachep;
+ static struct kmem_cache *anon_vma_chain_cachep;
+ 
+@@ -811,6 +836,9 @@
+ 	int referenced = 0;
+ 
+ 	while (page_vma_mapped_walk(&pvmw)) {
++		//#ifdef CONFIG_MIG_RMAP_TIMING
++		//_ptl_t0 = ktime_get_ns();
++		//#endif
+ 		address = pvmw.address;
+ 
+ 		if ((vma->vm_flags & VM_LOCKED) &&
+@@ -1475,8 +1503,17 @@
+ 	pte_t pteval;
+ 	struct page *subpage;
+ 	bool anon_exclusive, ret = true;
++
++	#ifdef CONFIG_MIG_RMAP_TIMING
++	u64 _ptl_t0 = 0, _ipi_t0 = 0;
++	#endif
++
+ 	struct mmu_notifier_range range;
+ 	enum ttu_flags flags = (enum ttu_flags)(long)arg;
++	
++	// #ifdef CONFIG_MIG_RMAP_TIMING
++	// u64 _ptl_t0 = 0, _ipi_t0 = 0;
++	// #endif
+ 
+ 	/*
+ 	 * When racing against e.g. zap_pte_range() on another cpu,
+@@ -1512,6 +1549,12 @@
+ 	mmu_notifier_invalidate_range_start(&range);
+ 
+ 	while (page_vma_mapped_walk(&pvmw)) {
++
++
++		#ifdef CONFIG_MIG_RMAP_TIMING
++		_ptl_t0 = ktime_get_ns();
++		#endif
++
+ 		/* Unexpected PMD-mapped THP? */
+ 		VM_BUG_ON_FOLIO(!pvmw.pte, folio);
+ 
+@@ -1605,7 +1648,13 @@
+ 
+ 				set_tlb_ubc_flush_pending(mm, pte_dirty(pteval));
+ 			} else {
+-				pteval = ptep_clear_flush(vma, address, pvmw.pte);
++		#ifdef CONFIG_MIG_RMAP_TIMING
++		_ipi_t0 = ktime_get_ns();
++#endif
++		pteval = ptep_clear_flush(vma, address, pvmw.pte);
++#ifdef CONFIG_MIG_RMAP_TIMING
++		this_cpu_add(mig_rmap_timing.ipi_ns, ktime_get_ns() - _ipi_t0);
++#endif
+ 			}
+ 		}
+ 
+@@ -1786,11 +1835,27 @@
+ 		 * See Documentation/mm/mmu_notifier.rst
+ 		 */
+ 		page_remove_rmap(subpage, vma, folio_test_hugetlb(folio));
++		
++		// #ifdef CONFIG_MIG_RMAP_TIMING
++		// this_cpu_add(mig_rmap_timing.ptl_ns, ktime_get_ns() - _ptl_t0);
++		// #endif
++
++		
++
+ 		if (vma->vm_flags & VM_LOCKED)
+ 			mlock_page_drain_local();
+-		folio_put(folio);
++		//folio_put(folio);
++		//folio_put(subpage_folio(subpage));
++		
++		#ifdef CONFIG_MIG_RMAP_TIMING
++		this_cpu_add(mig_rmap_timing.ptl_ns, ktime_get_ns() - _ptl_t0);
++		#endif
++
++
++		folio_put(page_folio(subpage));
+ 	}
+ 
++
+ 	mmu_notifier_invalidate_range_end(&range);
+ 
+ 	return ret;
+@@ -1849,6 +1914,10 @@
+ 	struct mmu_notifier_range range;
+ 	enum ttu_flags flags = (enum ttu_flags)(long)arg;
+ 
++	#ifdef CONFIG_MIG_RMAP_TIMING
++		u64 _ptl_t0 = 0, _ipi_t0 = 0;
++	#endif
++
+ 	/*
+ 	 * When racing against e.g. zap_pte_range() on another cpu,
+ 	 * in between its ptep_get_and_clear_full() and page_remove_rmap(),
+@@ -1887,7 +1956,8 @@
+ 	mmu_notifier_invalidate_range_start(&range);
+ 
+ 	while (page_vma_mapped_walk(&pvmw)) {
+-#ifdef CONFIG_ARCH_ENABLE_THP_MIGRATION
++	#ifdef CONFIG_ARCH_ENABLE_THP_MIGRATION
++
+ 		/* PMD-mapped THP migration entry */
+ 		if (!pvmw.pte) {
+ 			subpage = folio_page(folio,
+@@ -1902,11 +1972,15 @@
+ 			}
+ 			continue;
+ 		}
+-#endif
++	#endif
+ 
+ 		/* Unexpected PMD-mapped THP? */
+ 		VM_BUG_ON_FOLIO(!pvmw.pte, folio);
+ 
++		#ifdef CONFIG_MIG_RMAP_TIMING
++                	_ptl_t0 = ktime_get_ns();
++        	#endif
++
+ 		if (folio_is_zone_device(folio)) {
+ 			/*
+ 			 * Our PTE is a non-present device exclusive entry and
+@@ -1983,8 +2057,43 @@
+ 			pteval = huge_ptep_clear_flush(vma, address, pvmw.pte);
+ 		} else {
+ 			flush_cache_page(vma, address, pte_pfn(*pvmw.pte));
+-			/* Nuke the page table entry. */
+-			pteval = ptep_clear_flush(vma, address, pvmw.pte);
++			if (should_defer_flush(mm, flags)) {
++				/*
++				 * O1 — Deferred batch TLB shootdown.
++				 *
++				 * ptep_get_and_clear() atomically zeros the PTE
++				 * (LOCK CMPXCHG on x86) and returns the old value
++				 * WITHOUT issuing INVLPG or flush_tlb_others().
++				 *
++				 * set_tlb_ubc_flush_pending() registers this mm
++				 * so that the caller's try_to_unmap_flush() will
++				 * issue ONE arch_tlbbatch_flush() covering ALL
++				 * pages in the batch after Phase 1 completes.
++				 *
++				 * Safety: any worker accessing this VA after
++				 * the PTE is cleared hits the migration swap
++				 * entry (Present=0) and sleeps in
++				 * migration_entry_wait() until folio_unlock(src).
++				 * The src physical page is not freed until after
++				 * the batch flush, so no stale TLB access can
++				 * reach reallocated memory.
++				 */
++				pteval = ptep_get_and_clear(mm, address, pvmw.pte);
++				set_tlb_ubc_flush_pending(mm, pte_dirty(pteval));
++			} else {
++				/*
++				 * Standard per-page path: clear PTE and
++				 * immediately issue IPI to all remote CPUs.
++				 */
++#ifdef CONFIG_MIG_RMAP_TIMING
++				_ipi_t0 = ktime_get_ns();
++#endif
++				pteval = ptep_clear_flush(vma, address, pvmw.pte);
++#ifdef CONFIG_MIG_RMAP_TIMING
++				this_cpu_add(mig_rmap_timing.ipi_ns,
++					     ktime_get_ns() - _ipi_t0);
++#endif
++			}
+ 		}
+ 
+ 		/* Set the dirty flag on the folio now the pte is gone. */
+@@ -2129,6 +2238,11 @@
+ 		page_remove_rmap(subpage, vma, folio_test_hugetlb(folio));
+ 		if (vma->vm_flags & VM_LOCKED)
+ 			mlock_page_drain_local();
++		
++		#ifdef CONFIG_MIG_RMAP_TIMING
++		this_cpu_add(mig_rmap_timing.ptl_ns, ktime_get_ns() - _ptl_t0);  /* ← ADD */
++		#endif
++		
+ 		folio_put(folio);
+ 	}
+ 
+@@ -2158,8 +2272,13 @@
+ 	 * Migration always ignores mlock and only supports TTU_RMAP_LOCKED and
+ 	 * TTU_SPLIT_HUGE_PMD and TTU_SYNC flags.
+ 	 */
++	/*
++	 * O1: TTU_BATCH_FLUSH is now permitted for the migration path so
++	 * that migrate_pages_deferred_ipi() can defer flush_tlb_others()
++	 * to a single batch call after all pages are unmapped.
++	 */
+ 	if (WARN_ON_ONCE(flags & ~(TTU_RMAP_LOCKED | TTU_SPLIT_HUGE_PMD |
+-					TTU_SYNC)))
++					TTU_SYNC | TTU_BATCH_FLUSH)))
+ 		return;
+ 
+ 	if (folio_is_zone_device(folio) &&
+@@ -2430,7 +2549,15 @@
+ 		/* anon_vma disappear under us? */
+ 		VM_BUG_ON_FOLIO(!anon_vma, folio);
+ 	} else {
++	#ifdef CONFIG_MIG_RMAP_TIMING
++	{
++		u64 _rwsem_t0 = ktime_get_ns();
+ 		anon_vma = rmap_walk_anon_lock(folio, rwc);
++		this_cpu_add(mig_rmap_timing.rwsem_ns, ktime_get_ns() - _rwsem_t0);
++	}
++#else
++	anon_vma = rmap_walk_anon_lock(folio, rwc);
++#endif
+ 	}
+ 	if (!anon_vma)
+ 		return;

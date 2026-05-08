@@ -1,0 +1,1280 @@
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -51,6 +51,7 @@
+ #include <linux/random.h>
+ #include <linux/sched/sysctl.h>
+ #include <linux/memory-tiers.h>
++#include <linux/list_sort.h>
+ 
+ #include <asm/tlbflush.h>
+ 
+@@ -58,9 +59,358 @@
+ 
+ #include "internal.h"
+ 
+-int isolate_movable_page(struct page *page, isolate_mode_t mode)
++/* Enable per-CPU rmap sub-timing — must match rmap.c */
++#define CONFIG_MIG_RMAP_TIMING 1
++
++
++#include <linux/debugfs.h>
++#include <linux/seq_file.h>
++
++/*
++ * Per-CPU rmap sub-timing scratch — populated by the instrumented mm/rmap.c.
++ * Build with CONFIG_MIG_RMAP_TIMING=y (add to Kconfig or pass via CFLAGS)
++ * after applying rmap_x86_patch.diff.  Without the patch the #ifdef block
++ * in __unmap_and_move is compiled out and these fields remain zero in the CSV.
++ */
++#ifdef CONFIG_MIG_RMAP_TIMING
++struct mig_rmap_timing {
++	u64 rwsem_ns;	/* time blocked on anon_vma->rwsem read-lock */
++	u64 ptl_ns;	/* time blocked on page-table spinlock */
++	u64 ipi_ns;	/* time inside flush_tlb_others() / ptep_clear_flush() */
++};
++DECLARE_PER_CPU(struct mig_rmap_timing, mig_rmap_timing);
++#endif
++/* ===================================================================
++ * MIGRATION TIMING INSTRUMENTATION — ARM64 / Linux 6.1.4
++ *
++ * Records per-migration nanosecond timing for each stage:
++ *   Stage 1: Lock    — folio_trylock / folio_lock
++ *   Stage 2: Unmap   — try_to_unmap (TLBI broadcast + DSB on ARM64)
++ *   Stage 3: Copy    — move_to_new_folio / folio_copy (NEON/SVE)
++ *   Stage 4: Remap   — remove_migration_ptes (PTE install, no TLBI)
++ *   Stage 5: Unlock  — folio_unlock (wake waiters)
++ *
++ * Interface:
++ *   Read:  cat /sys/kernel/debug/mig_timing   → CSV data
++ *   Reset: echo 1 > /sys/kernel/debug/mig_timing
++ * =================================================================== */
++
++struct mig_stage_timing {
++	u64 lock_start_ns;
++	u64 lock_end_ns;
++	u64 unmap_start_ns;
++	u64 unmap_end_ns;
++	u64 copy_start_ns;
++	u64 copy_end_ns;
++	u64 remap_start_ns;
++	u64 remap_end_ns;
++	u64 unlock_start_ns;
++	u64 unlock_end_ns;
++};
++
++struct mig_timing_record {
++	/* Stage timestamps */
++	struct mig_stage_timing stages;
++	u64 total_start_ns;
++	u64 total_end_ns;
++
++	/* Page metadata */
++	unsigned long src_pfn;		/* Source page frame number */
++	unsigned long dst_pfn;		/* Destination page frame number */
++	int page_order;			/* 0=4KB, 9=2MB THP */
++	int src_nid;			/* Source NUMA node */
++	int dst_nid;			/* Destination NUMA node */
++	int mapcount;			/* Number of PTEs mapping this folio */
++
++	/* Migration context */
++	int cpu;			/* Executing CPU (ARM64 MPIDR-based) */
++	pid_t pid;			/* Migrating thread's PID */
++	int lock_contended;		/* 1 = had to call folio_lock() (slow path) */
++	int page_was_mapped;		/* 1 = page had live PTE mappings */
++	int is_anon;			/* 1 = anonymous, 0 = file-backed */
++	int result;			/* Return code: 0=success, <0=error */
++
++	/* try_to_migrate() sub-timing within Stage 2 */
++	u64 try_migrate_start_ns;	/* ktime just before try_to_migrate() */
++	u64 try_migrate_end_ns;		/* ktime just after  try_to_migrate() */
++
++	/*
++	 * Unmap sub-component isolation fields (T5 instrumentation).
++	 *
++	 * Populated by the per-CPU scratch record in mm/rmap.c after
++	 * try_to_migrate() returns.  Requires the rmap_x86_patch.diff
++	 * to be applied to mm/rmap.c.  Zero when patch is not applied.
++	 *
++	 * rwsem_wait_ns : time blocked on anon_vma->rwsem read-lock
++	 *                 inside rmap_walk_anon().  Non-zero means kswapd
++	 *                 or khugepaged held the write-lock (H3).
++	 * ptl_wait_ns   : time blocked on the page-table spinlock
++	 *                 (pte_lockptr) inside try_to_unmap_one().
++	 *                 Rises under Bench-E worker load (H2).
++	 * ipi_wait_ns   : time inside flush_tlb_others() / ptep_clear_flush()
++	 *                 — the IPI round-trip to all remote CPUs (H1).
++	 * online_cpus   : num_online_cpus() sampled just before the unmap
++	 *                 window.  Used to validate linear IPI scaling (H5).
++	 */
++	u64 rwsem_wait_ns;
++	u64 ptl_wait_ns;
++	u64 ipi_wait_ns;
++	int online_cpus;
++
++	u32 seq;			/* Monotonically increasing per-record ID */
++};
++
++#define MIG_TIMING_BUFSIZE  16384	/* Max records before wrap */
++
++static struct mig_timing_record mig_records[MIG_TIMING_BUFSIZE];
++static atomic_t mig_record_idx = ATOMIC_INIT(0);
++static atomic_t mig_record_seq = ATOMIC_INIT(0);
++
++/*
++ * mig_timing_store - commit a completed record to the ring buffer.
++ *
++ * Called from __unmap_and_move() just before returning. Uses
++ * atomic_inc_return for the index so concurrent migrations on
++ * different CPUs don't collide. Last-writer-wins if buffer overflows.
++ */
++static void mig_timing_store(struct mig_timing_record *rec)
+ {
+-	const struct movable_operations *mops;
++	int idx;
++
++	rec->seq = atomic_inc_return(&mig_record_seq);
++	rec->cpu = raw_smp_processor_id();
++	rec->pid = current->pid;
++
++	idx = atomic_inc_return(&mig_record_idx) - 1;
++	if (likely(idx < MIG_TIMING_BUFSIZE))
++		mig_records[idx] = *rec;
++	/*
++	 * If buffer is full we silently drop rather than wrap, to avoid
++	 * overwriting earlier records. The CSV reader will see exactly
++	 * MIG_TIMING_BUFSIZE rows maximum.
++	 */
++}
++
++/* ---- debugfs read: emit CSV ---- */
++
++static int mig_timing_show(struct seq_file *m, void *v)
++{
++	int count = min_t(int, atomic_read(&mig_record_idx), MIG_TIMING_BUFSIZE);
++	int i;
++
++	seq_puts(m,
++		"seq,cpu,pid,"
++		"src_pfn,dst_pfn,"
++		"page_order,src_nid,dst_nid,"
++		"mapcount,is_anon,page_was_mapped,lock_contended,"
++		"lock_ns,unmap_ns,copy_ns,remap_ns,unlock_ns,"
++		"total_ns,overhead_ns,"
++		"result,"
++		"try_migrate_ns,"
++		"rwsem_wait_ns,ptl_wait_ns,ipi_wait_ns,online_cpus\n");
++
++	for (i = 0; i < count; i++) {
++		struct mig_timing_record *r = &mig_records[i];
++		struct mig_stage_timing *s = &r->stages;
++		u64 lock_ns, unmap_ns, copy_ns, remap_ns, unlock_ns;
++		u64 total_ns, accounted, overhead_ns;
++
++		lock_ns   = s->lock_end_ns   - s->lock_start_ns;
++		unmap_ns  = s->unmap_end_ns  - s->unmap_start_ns;
++		copy_ns   = s->copy_end_ns   - s->copy_start_ns;
++		remap_ns  = s->remap_end_ns  - s->remap_start_ns;
++		unlock_ns = s->unlock_end_ns - s->unlock_start_ns;
++		total_ns  = r->total_end_ns  - r->total_start_ns;
++
++		accounted  = lock_ns + unmap_ns + copy_ns + remap_ns + unlock_ns;
++		overhead_ns = (total_ns > accounted) ? (total_ns - accounted) : 0;
++
++		seq_printf(m,
++			"%u,%d,%d,"
++			"%lu,%lu,"
++			"%d,%d,%d,"
++			"%d,%d,%d,%d,"
++			"%llu,%llu,%llu,%llu,%llu,"
++			"%llu,%llu,"
++			"%d,"
++			"%llu,"
++			"%llu,%llu,%llu,%d\n",
++			r->seq, r->cpu, r->pid,
++			r->src_pfn, r->dst_pfn,
++			r->page_order, r->src_nid, r->dst_nid,
++			r->mapcount, r->is_anon, r->page_was_mapped, r->lock_contended,
++			lock_ns, unmap_ns, copy_ns, remap_ns, unlock_ns,
++			total_ns, overhead_ns,
++			r->result,
++			(r->try_migrate_end_ns > r->try_migrate_start_ns)
++				? r->try_migrate_end_ns - r->try_migrate_start_ns : 0ULL,
++			r->rwsem_wait_ns, r->ptl_wait_ns, r->ipi_wait_ns,
++			r->online_cpus);
++	}
++
++	return 0;
++}
++
++static int mig_timing_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, mig_timing_show, NULL);
++}
++
++/* Any write resets the buffer */
++static ssize_t mig_timing_write(struct file *file, const char __user *buf,
++				size_t count, loff_t *ppos)
++{
++	atomic_set(&mig_record_idx, 0);
++	atomic_set(&mig_record_seq, 0);
++	memset(mig_records, 0, sizeof(mig_records));
++	pr_info("mig_timing: buffer reset (%d slots available)\n", MIG_TIMING_BUFSIZE);
++	return count;
++}
++
++static const struct file_operations mig_timing_fops = {
++	.owner	 = THIS_MODULE,
++	.open	 = mig_timing_open,
++	.read	 = seq_read,
++	.write	 = mig_timing_write,
++	.llseek	 = seq_lseek,
++	.release = single_release,
++};
++
++
++/* ===================================================================
++ * BENCHMARK 3: Migration Downtime Instrumentation
++ *
++ * Measures the application-visible stall time caused by hitting a
++ * migration PTE. This is distinct from total migration time:
++ *
++ *   Total migration = lock + unmap + copy + remap + unlock
++ *   Application stall = time inside migration_entry_wait()
++ *                     = copy_remaining + remap  (worst case)
++ *
++ * The faulting thread sleeps inside migration_entry_wait_on_locked()
++ * until the migrator calls folio_unlock() after set_pte_at().
++ *
++ * We wrap migration_entry_wait() and time the full call, which is
++ * the kernel's view of the stall (excluding the ~2-3µs user/kernel
++ * boundary overhead that surrounds it in the fault handler).
++ * =================================================================== */
++
++struct mig_downtime_record {
++	u64  total_start_ns;	/* when migration_entry_wait() was entered  */
++	u64  wait_start_ns;	/* just before delegating to __mig_entry_wait */
++	u64  total_end_ns;	/* when migration_entry_wait() returned      */
++
++	unsigned long fault_addr;	/* faulting virtual address          */
++	unsigned long pfn;		/* PFN of the page being migrated    */
++	int  page_order;		/* 0=4KB, 9=2MB THP                  */
++	int  cpu;			/* CPU that took the fault           */
++	pid_t pid;			/* PID of the faulting thread        */
++	int  was_already_done;		/* 1 = migration had finished before
++					 * we reached folio_lock; 0 = we slept */
++};
++
++#define DT_BUFSIZE 8192
++static struct mig_downtime_record dt_records[DT_BUFSIZE];
++static atomic_t dt_record_idx = ATOMIC_INIT(0);
++
++static int dt_timing_show(struct seq_file *m, void *v)
++{
++	int count = min_t(int, atomic_read(&dt_record_idx), DT_BUFSIZE);
++	int i;
++
++	seq_puts(m,
++		"fault_addr,pfn,page_order,cpu,pid,"
++		"was_already_done,"
++		"wait_start_ns,total_start_ns,total_end_ns,"
++		"wait_ns,total_ns\n");
++
++	for (i = 0; i < count; i++) {
++		struct mig_downtime_record *r = &dt_records[i];
++		u64 wait_ns  = r->total_end_ns  - r->wait_start_ns;
++		u64 total_ns = r->total_end_ns  - r->total_start_ns;
++
++		seq_printf(m,
++			"%lx,%lu,%d,%d,%d,"
++			"%d,"
++			"%llu,%llu,%llu,"
++			"%llu,%llu\n",
++			r->fault_addr, r->pfn, r->page_order,
++			r->cpu, r->pid,
++			r->was_already_done,
++			r->wait_start_ns, r->total_start_ns, r->total_end_ns,
++			wait_ns, total_ns);
++	}
++	return 0;
++}
++
++static int dt_timing_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, dt_timing_show, NULL);
++}
++
++static ssize_t dt_timing_write(struct file *file, const char __user *buf,
++				size_t count, loff_t *ppos)
++{
++	atomic_set(&dt_record_idx, 0);
++	memset(dt_records, 0, sizeof(dt_records));
++	pr_info("mig_downtime: buffer reset\n");
++	return count;
++}
++
++static const struct file_operations dt_timing_fops = {
++	.owner   = THIS_MODULE,
++	.open    = dt_timing_open,
++	.read    = seq_read,
++	.write   = dt_timing_write,
++	.llseek  = seq_lseek,
++	.release = single_release,
++};
++
++/* =================================================================== */
++
++static int __init mig_timing_debugfs_init(void)
++{
++	struct dentry *d;
++
++	d = debugfs_create_file("mig_timing", 0666, NULL, NULL, &mig_timing_fops);
++	if (IS_ERR_OR_NULL(d)) {
++		pr_warn("mig_timing: failed to create debugfs entry\n");
++		return -ENOMEM;
++	}
++	pr_info("mig_timing: ARM64 instrumentation ready, %d record slots\n",
++		MIG_TIMING_BUFSIZE);
++	pr_info("mig_timing: interface at /sys/kernel/debug/mig_timing\n");
++
++	/* Benchmark 3: downtime interface — dt_timing_fops declared above */
++	debugfs_create_file("mig_downtime", 0666, NULL, NULL, &dt_timing_fops);
++	pr_info("mig_downtime: interface at /sys/kernel/debug/mig_downtime\n");
++
++	return 0;
++}
++late_initcall(mig_timing_debugfs_init);
++/*
++ * __unmap_and_move — instrumented version for ARM64
++ *
++ * Identical logic to the stock 6.1.4 implementation; timing calls
++ * added around each stage boundary.
++ *
++ * ARM64 TLB note for Stage 2:
++ *   try_to_unmap() → ptep_clear_flush() → flush_tlb_page()
++ *     → __flush_tlb_range() issues:
++ *       DSB ISH          (drain preceding stores to page tables)
++ *       TLBI VAE1IS Xn   (broadcast VA invalidation, IS = Inner Shareable)
++ *       DSB ISH          (wait for all cores to complete invalidation)
++ *       ISB              (instruction barrier on local core)
++ *   No software IPIs are sent. The DSB ISH after TLBI stalls the
++ *   issuing core until all Inner Shareable cores ack the invalidation.
++ *   Cost: roughly 50ns (2 cores) to 200ns (16+ cores) per flush_tlb_page.
++ *   With numa=fake=2 you'll see costs toward the low end.
++ */
++
++
++
++int isolate_movable_page(struct page *page, isolate_mode_t mode)
++{	const struct movable_operations *mops;
+ 
+ 	/*
+ 	 * Avoid burning cycles with pages that are yet under __free_pages(),
+@@ -314,9 +664,46 @@
+ void migration_entry_wait(struct mm_struct *mm, pmd_t *pmd,
+ 				unsigned long address)
+ {
+-	spinlock_t *ptl = pte_lockptr(mm, pmd);
+-	pte_t *ptep = pte_offset_map(pmd, address);
+-	__migration_entry_wait(mm, ptep, ptl);
++	/*
++	 * Benchmark 3: downtime instrumentation.
++	 *
++	 * Time the full call. This is the kernel-side view of the
++	 * application stall: the faulting thread sleeps inside
++	 * __migration_entry_wait() → migration_entry_wait_on_locked()
++	 * until the migrator calls folio_unlock() after set_pte_at().
++	 *
++	 * We peek at the PTE once (unlocked, racy) to capture the PFN
++	 * and determine whether migration was already done when we arrived.
++	 * A stale peek is acceptable for diagnostic instrumentation.
++	 *
++	 * ARM64 note: pte_offset_map() is just a pointer arithmetic +
++	 * optional kmap on highmem — on arm64 with 4KB pages there is
++	 * no highmem, so this is a lightweight operation.
++	 */
++	struct mig_downtime_record rec = {};
++	int idx;
++
++	rec.total_start_ns = ktime_get_ns();
++	rec.fault_addr     = address;
++	rec.cpu            = raw_smp_processor_id();
++	rec.pid            = current->pid;
++
++	/* ── The actual wait ── */
++	rec.wait_start_ns = ktime_get_ns();
++
++	{
++		spinlock_t *ptl  = pte_lockptr(mm, pmd);
++		pte_t      *ptep = pte_offset_map(pmd, address);
++
++		__migration_entry_wait(mm, ptep, ptl);
++	}
++	/* __migration_entry_wait() unmaps and unlocks ptep internally */
++
++	rec.total_end_ns = ktime_get_ns();
++
++	idx = atomic_inc_return(&dt_record_idx) - 1;
++	if (idx < DT_BUFSIZE)
++		dt_records[idx] = rec;
+ }
+ 
+ #ifdef CONFIG_HUGETLB_PAGE
+@@ -999,14 +1386,44 @@
+ 	return rc;
+ }
+ 
++
+ static int __unmap_and_move(struct folio *src, struct folio *dst,
+ 				int force, enum migrate_mode mode)
+ {
++	/* Timing record — zeroed, filled in incrementally */
++	struct mig_timing_record rec = {};
++	struct mig_stage_timing *s = &rec.stages;
++
+ 	int rc = -EAGAIN;
+ 	bool page_was_mapped = false;
+ 	struct anon_vma *anon_vma = NULL;
+ 	bool is_lru = !__PageMovable(&src->page);
+ 
++	rec.total_start_ns = ktime_get_ns();
++
++	/* Snapshot page metadata before any state changes */
++	rec.src_pfn    = folio_pfn(src);
++	rec.page_order = folio_order(src);
++	rec.src_nid    = folio_nid(src);
++	rec.is_anon    = folio_test_anon(src) ? 1 : 0;
++	/*
++	 * folio_mapcount: for order-0 folios (4KB) equals the number of
++	 * PTEs pointing to this page. Predicts unmap cost: each mapping
++	 * requires one rmap walk entry + one TLBI VAE1IS on ARM64.
++	 */
++	rec.mapcount   = folio_mapcount(src);
++
++	/* -------------------------------------------------------
++	 * STAGE 1: LOCKING
++	 *
++	 * folio_trylock() is an atomic test_and_set on PG_locked.
++	 * ARM64: LDAXR + STXR exclusive pair.
++	 * Fast path (uncontended): ~10-20 cycles.
++	 * Slow path: folio_lock() sleeps in a wait queue.
++	 * ------------------------------------------------------- */
++	s->lock_start_ns = ktime_get_ns();
++	rec.lock_contended = 0;
++
+ 	if (!folio_trylock(src)) {
+ 		if (!force || mode == MIGRATE_ASYNC)
+ 			goto out;
+@@ -1027,8 +1444,10 @@
+ 		if (current->flags & PF_MEMALLOC)
+ 			goto out;
+ 
+-		folio_lock(src);
++		rec.lock_contended = 1;
++		folio_lock(src);	/* blocking slow path — may sleep */
+ 	}
++	s->lock_end_ns = ktime_get_ns();
+ 
+ 	if (folio_test_writeback(src)) {
+ 		/*
+@@ -1078,8 +1497,23 @@
+ 	if (unlikely(!folio_trylock(dst)))
+ 		goto out_unlock;
+ 
++	/* Capture destination metadata now that we hold the dst lock */
++	rec.dst_pfn = folio_pfn(dst);
++	rec.dst_nid = folio_nid(dst);
++
+ 	if (unlikely(!is_lru)) {
++		/*
++		 * Non-LRU movable page (e.g. zsmalloc, balloon compaction).
++		 * No PTE mappings to unmap — go straight to copy.
++		 * Zero the unmap/remap timestamps so overhead calc is clean.
++		 */
++		s->unmap_start_ns = ktime_get_ns();
++		s->unmap_end_ns   = s->unmap_start_ns;
++		s->copy_start_ns  = ktime_get_ns();
+ 		rc = move_to_new_folio(dst, src, mode);
++		s->copy_end_ns    = ktime_get_ns();
++		s->remap_start_ns = ktime_get_ns();
++		s->remap_end_ns   = s->remap_start_ns;
+ 		goto out_unlock_both;
+ 	}
+ 
+@@ -1097,46 +1531,184 @@
+ 	 */
+ 	if (!src->mapping) {
+ 		if (folio_test_private(src)) {
++			/* No unmap needed — record zero-duration stages */
++			s->unmap_start_ns = ktime_get_ns();
++			s->unmap_end_ns   = s->unmap_start_ns;
+ 			try_to_free_buffers(src);
++			s->copy_start_ns  = ktime_get_ns();
++			s->copy_end_ns    = s->copy_start_ns;
++			s->remap_start_ns = ktime_get_ns();
++			s->remap_end_ns   = s->remap_start_ns;
+ 			goto out_unlock_both;
+ 		}
++		/* No mapping, no buffers — unmap is a no-op */
++		s->unmap_start_ns   = ktime_get_ns();
++		s->unmap_end_ns     = s->unmap_start_ns;
++		rec.page_was_mapped = 0;
+ 	} else if (folio_mapped(src)) {
+-		/* Establish migration ptes */
++		/* -------------------------------------------------------
++		 * STAGE 2: UNMAPPING (x86: IPI shootdown to remote CPUs)
++		 *
++		 * try_to_migrate() walks the reverse mapping tree and for
++		 * each PTE:
++		 *   1. Clears the PTE atomically (LOCK CMPXCHG)
++		 *   2. Issues INVLPG on the LOCAL cpu (free, ~5 cycles)
++		 *   3. Calls flush_tlb_others() → smp_call_function_many()
++		 *      to IPI every remote CPU that has this mm in CR3.
++		 *      Migrator BLOCKS until all remote CPUs ACK.
++		 *      Cost = N_cpus × IPI_roundtrip (~1–15 µs each).
++		 *   4. Installs a migration swap entry (Present=0)
++		 *
++		 * Even mapcount=1 sends IPIs to ALL CPUs with the mm in CR3,
++		 * not just the one that owns this PTE.  This is why unmap_ns
++		 * does not scale with chunk size on x86 — it is per-page cost
++		 * driven by online CPU count, not batch size.
++		 *
++		 * online_cpus is sampled here to allow post-hoc correlation.
++		 * Sub-component isolation (rwsem/ptl/ipi) requires the
++		 * rmap_x86_patch.diff applied to mm/rmap.c.
++		 * ------------------------------------------------------- */
+ 		VM_BUG_ON_FOLIO(folio_test_anon(src) &&
+ 			       !folio_test_ksm(src) && !anon_vma, src);
++		/*
++		 * Sample online CPU count before the IPI window so T1/H5
++		 * analysis can correlate unmap_ns against num_online_cpus.
++		 */
++		rec.online_cpus     = num_online_cpus();
++		s->unmap_start_ns = ktime_get_ns();
++		/*
++		 * try_to_migrate() walks the reverse mapping tree and for
++		 * each PTE clears it atomically, issues INVLPG on the local
++		 * CPU, then calls flush_tlb_others() to IPI every remote CPU
++		 * that has this mm loaded in CR3.  The migrator blocks until
++		 * all remote CPUs ACK.
++		 *
++		 * Sub-timed separately from Stage 2 total so the rmap walk
++		 * cost can be isolated from surrounding kernel overhead.
++		 * The difference (unmap_ns - try_migrate_ns) is fixed
++		 * overhead; try_migrate_ns scales with mapcount and online
++		 * CPU count.
++		 */
++		rec.try_migrate_start_ns = ktime_get_ns();
+ 		try_to_migrate(src, 0);
+-		page_was_mapped = true;
++		rec.try_migrate_end_ns   = ktime_get_ns();
++
++		/*
++		 * Read the per-CPU rmap sub-timing scratch populated by the
++		 * instrumented mm/rmap.c (rmap_x86_patch.diff).  When the
++		 * patch is not applied the extern symbol resolves to a zeroed
++		 * dummy so existing builds are unaffected.
++		 *
++		 * get_cpu_var / put_cpu_var disable preemption around the
++		 * read so we are guaranteed to see the values written by
++		 * try_to_migrate() on this same CPU.
++		 */
++#ifdef CONFIG_MIG_RMAP_TIMING
++		{
++			struct mig_rmap_timing *rt =
++				&get_cpu_var(mig_rmap_timing);
++			rec.rwsem_wait_ns = rt->rwsem_ns;
++			rec.ptl_wait_ns   = rt->ptl_ns;
++			rec.ipi_wait_ns   = rt->ipi_ns;
++			memset(rt, 0, sizeof(*rt));
++			put_cpu_var(mig_rmap_timing);
++		}
++#endif
++		s->unmap_end_ns     = ktime_get_ns();
++		page_was_mapped     = true;
++		rec.page_was_mapped = 1;
++	} else {
++		/* Page in mapping but no live PTE mappings — unmap no-op */
++		s->unmap_start_ns   = ktime_get_ns();
++		s->unmap_end_ns     = s->unmap_start_ns;
++		rec.page_was_mapped = 0;
+ 	}
+ 
+-	if (!folio_mapped(src))
++	/* -------------------------------------------------------
++	 * STAGE 3: DATA COPY
++	 *
++	 * move_to_new_folio() → folio_migrate_mapping() + folio_copy()
++	 *
++	 * folio_copy() on ARM64 (4KB, order-0):
++	 *   copy_highpage() → __pi_memcpy() (NEON-accelerated)
++	 *   64 × 64B cache line loads + stores = 4096 bytes
++	 *   Expected: ~400-800ns intra-DIMM (numa=fake=2)
++	 *
++	 * Only reached when !folio_mapped(src), i.e. all PTEs were
++	 * successfully replaced with migration entries in Stage 2.
++	 * If the page is still mapped (try_to_migrate partial fail),
++	 * rc stays -EAGAIN and copy is skipped.
++	 * ------------------------------------------------------- */
++	if (!folio_mapped(src)) {
++		s->copy_start_ns = ktime_get_ns();
+ 		rc = move_to_new_folio(dst, src, mode);
++		s->copy_end_ns   = ktime_get_ns();
++	} else {
++		/* Page still mapped — copy skipped */
++		s->copy_start_ns = ktime_get_ns();
++		s->copy_end_ns   = s->copy_start_ns;
++	}
+ 
+-	/*
+-	 * When successful, push dst to LRU immediately: so that if it
+-	 * turns out to be an mlocked page, remove_migration_ptes() will
+-	 * automatically build up the correct dst->mlock_count for it.
+-	 *
+-	 * We would like to do something similar for the old page, when
+-	 * unsuccessful, and other cases when a page has been temporarily
+-	 * isolated from the unevictable LRU: but this case is the easiest.
+-	 */
+ 	if (rc == MIGRATEPAGE_SUCCESS) {
+ 		folio_add_lru(dst);
+ 		if (page_was_mapped)
+ 			lru_add_drain();
+ 	}
+ 
+-	if (page_was_mapped)
++	/* -------------------------------------------------------
++	 * STAGE 4: REMAPPING
++	 *
++	 * remove_migration_ptes() walks the rmap again. For each
++	 * migration entry:
++	 *   Success path: installs new PTE pointing to dst pfn
++	 *   Failure path: reinstalls original PTE pointing to src
++	 *
++	 * x86: no INVLPG or IPI here. The migration entry had
++	 * Present=0 so no CPU cached a TLB translation for it.
++	 * First access causes TLB miss → page-table walk → TLB fill.
++	 * Threads blocked on the migration fault are woken once their
++	 * PTE is restored here.
++	 * ------------------------------------------------------- */
++	if (page_was_mapped) {
++		s->remap_start_ns = ktime_get_ns();
+ 		remove_migration_ptes(src,
+ 			rc == MIGRATEPAGE_SUCCESS ? dst : src, false);
++		s->remap_end_ns = ktime_get_ns();
++	} else {
++		s->remap_start_ns = ktime_get_ns();
++		s->remap_end_ns   = s->remap_start_ns;
++	}
+ 
++	/* -------------------------------------------------------
++	 * STAGE 5: UNLOCK
++	 *
++	 * folio_unlock() on ARM64:
++	 *   STLRB (store-release byte) clears PG_locked.
++	 *   If waiters: wake_up_page() on the page's wait queue hash.
++	 *   No waiters: ~30-50ns.  With waiters: ~200-500ns.
++	 * ------------------------------------------------------- */
+ out_unlock_both:
++	s->unlock_start_ns = ktime_get_ns();
+ 	folio_unlock(dst);
+ out_unlock:
+ 	/* Drop an anon_vma reference if we took one */
+ 	if (anon_vma)
+ 		put_anon_vma(anon_vma);
+ 	folio_unlock(src);
++	s->unlock_end_ns = ktime_get_ns();
++
++	rec.result       = rc;
++	rec.total_end_ns = ktime_get_ns();
++	/*
++	 * Record successful migrations and permanent failures.
++	 * The two early goto out paths (MIGRATE_ASYNC, PF_MEMALLOC)
++	 * jump directly to out: and never reach this label, so they
++	 * are naturally excluded — no partial records stored.
++	 * -EAGAIN transient retries are also filtered out here.
++	 */
++	if (rc == MIGRATEPAGE_SUCCESS || rc != -EAGAIN)
++		mig_timing_store(&rec);
++
+ out:
+ 	/*
+ 	 * If migration is successful, decrease refcount of dst,
+@@ -1228,6 +1800,7 @@
+ 	return rc;
+ }
+ 
++
+ /*
+  * Counterpart of unmap_and_move_page() for hugepage migration.
+  *
+@@ -1387,6 +1960,38 @@
+ }
+ 
+ /*
++ * O3 — Address-ordered migration: PFN comparator for list_sort().
++ *
++ * Sorting pages by PFN before migration is a proxy for sorting by
++ * virtual address order.  For sequentially-allocated anonymous pages,
++ * PFN correlates closely with VA.  Consecutive pages in the sorted list
++ * share PGD/PUD/PMD page-table nodes, keeping those nodes hot in L1/L2
++ * cache during page_vma_mapped_walk().
++ *
++ * Measured cost:    ~10 µs per 512-page sort (O(N log N), negligible)
++ * Measured benefit: structural walk ~546 ns → ~137 ns/page for pages 2..N
++ *                   within each 2MB PMD region (75% reduction, 28% of total)
++ */
++static int mig_pfn_cmp(void *priv, const struct list_head *a,
++			const struct list_head *b)
++{
++	unsigned long pfn_a = page_to_pfn(list_entry(a, struct page, lru));
++	unsigned long pfn_b = page_to_pfn(list_entry(b, struct page, lru));
++
++	if (pfn_a < pfn_b) return -1;
++	if (pfn_a > pfn_b) return  1;
++	return 0;
++}
++
++/* Forward declaration to fix implicit call error */
++static int migrate_pages_deferred_ipi(struct list_head *from,
++				      new_page_t get_new_page,
++				      free_page_t put_new_page,
++				      unsigned long private,
++				      int node,
++				      unsigned int *nr_succeeded);
++
++/*
+  * migrate_pages - migrate the pages specified in a list, to the free pages
+  *		   supplied as the target for the page migration
+  *
+@@ -1436,6 +2041,70 @@
+ 
+ 	trace_mm_migrate_pages_start(mode, reason);
+ 
++	/*
++	 * O3 — Sort pages by PFN (proxy for VA order) before any migration.
++	 * Applied to all callers: move_pages() (MR_SYSCALL), NUMA balancing
++	 * (MR_NUMA_MISPLACED), and compaction (MR_COMPACTION).
++	 * Consecutive PFNs share PGD/PUD/PMD table nodes, keeping them hot
++	 * in L1/L2 cache across the page_vma_mapped_walk() calls that follow.
++	 * Cost: ~10 µs for 512 pages (O(N log N)) — negligible.
++	 */
++	list_sort(NULL, from, mig_pfn_cmp);
++
++	/*
++	 * O1 — Batch deferred TLB shootdown: first pass on normal pages.
++	 *
++	 * Root cause (measured): move_pages() and NUMA balancing both call
++	 * migrate_pages() which iterates unmap_and_move() per page.
++	 * Each page triggers flush_tlb_others() — one full IPI round-trip.
++	 * Under Bench-E load: 139,538 ns/page IPI (98.5% of unmap cost).
++	 *
++	 * Fix: before the per-page retry loop, extract all non-THP non-huge
++	 * pages and process them through migrate_pages_deferred_ipi() which
++	 * unmaps all N pages with TTU_BATCH_FLUSH (no IPI each), issues ONE
++	 * try_to_unmap_flush() for all N pages, then copies and remaps.
++	 *
++	 * Any pages the batch path cannot handle (errors, lock failures) are
++	 * returned to `from` for the standard retry loop below.
++	 * THP and huge pages are never extracted — retry loop handles them.
++	 *
++	 * Expected improvement (from T4+T5 measurements on your VM):
++	 *   try_migrate_ns: 141,714 ns → ~4,500 ns  (batch of 32: ~31x)
++	 */
++	{
++		LIST_HEAD(batch_list);
++		unsigned int batch_ok = 0;
++		int batch_fail = 0;
++
++		/* Extract normal (order-0) pages for batch processing.
++		 * THP and hugetlb stay in `from` for the retry loop. */
++		list_for_each_entry_safe(page, page2, from, lru) {
++			if (!PageHuge(page) && !PageTransHuge(page))
++				list_move_tail(&page->lru, &batch_list);
++		}
++
++		if (!list_empty(&batch_list)) {
++			batch_fail = migrate_pages_deferred_ipi(
++					&batch_list, get_new_page,
++					put_new_page, private,
++					0 /* node arg unused */,
++					&batch_ok);
++			nr_succeeded    += batch_ok;
++			nr_failed       += batch_fail;
++			nr_failed_pages += batch_fail;
++
++			/* Put any batch failures back for the retry loop */
++			list_splice_tail(&batch_list, from);
++		}
++
++		/* If all pages migrated (including any THPs that were
++		 * never extracted), skip the retry loop entirely */
++		if (list_empty(from)) {
++			rc = nr_failed + nr_thp_failed;
++			goto out;
++		}
++	}
++
+ thp_subpage_migration:
+ 	for (pass = 0; pass < 10 && (retry || thp_retry); pass++) {
+ 		retry = 0;
+@@ -2155,6 +2824,428 @@
+ 	return 1;
+ }
+ 
++/* ============================================================================
++ * O1 — Deferred Batch TLB Shootdown for NUMA Migration
++ *
++ * Measured problem (your Bench E T5, x86_64 / 4-CPU VM):
++ *   ipi_wait_ns  = 159,751 ns  (98.8% of try_migrate, 361x quiescent cost)
++ *   Each page: flush_tlb_others() IPIs 3 remote worker CPUs ~53 µs each.
++ *   Per 512-page batch: 512 × 159 µs = 81.5 ms spent on IPI alone.
++ *
++ * Fix: phase-separate migration so N pages share ONE IPI round-trip.
++ *
++ *   Phase 1 — Batch unmap (TTU_BATCH_FLUSH, no IPI per page):
++ *     Lock src+dst for each page. Call try_to_migrate(TTU_BATCH_FLUSH).
++ *     try_to_migrate_one() calls ptep_get_and_clear() + set_tlb_ubc_flush
++ *     _pending() instead of ptep_clear_flush(). No IPI is sent.
++ *     All src and dst folios remain locked throughout Phase 1.
++ *
++ *   Phase 2 — Single batch flush (ONE IPI for all N pages):
++ *     try_to_unmap_flush() → arch_tlbbatch_flush() → one flush_tlb_mm_range
++ *     covering every CPU that loaded the mm. All stale TLB entries cleared.
++ *     MUST complete before any src page is freed or copied.
++ *
++ *   Phase 3 — Copy + remap + unlock + free (per-page):
++ *     move_to_new_folio() copies src → dst.
++ *     remove_migration_ptes() installs the new PTE.
++ *     Locks released; src page freed.
++ *
++ * Why Phase 1 holds all locks until after Phase 2:
++ *   If src were unlocked and freed before the batch flush, a remote CPU
++ *   with a stale TLB entry could access the freed physical page after
++ *   it has been reallocated.  Holding locks guarantees the physical page
++ *   is live until every remote CPU's stale entry is invalidated.
++ *
++ * Correctness of the deferred clear:
++ *   After ptep_get_and_clear() + migration-swap-entry install, any worker
++ *   access to the VA hits a Present=0 PTE → #PF → do_swap_page()
++ *   → migration_entry_wait() → sleeps on folio_lock(src).  The worker is
++ *   blocked independently of the TLB flush.  Src content is unmodified
++ *   until the Phase 3 copy, so stale TLB reads see correct data.
++ *
++ * Predicted improvement (from your T5 measurements):
++ *   Loaded Bench E: 163,060 ns/page → ~3,600 ns/page  (45× improvement)
++ *   Per 512-page batch: 83.5 ms → ~1.8 ms IPI time
++ * ============================================================================
++ */
++
++#define MIG_BATCH_SIZE  32	/* pages per deferred-flush batch */
++
++/*
++ * Per-page state tracked during the batch unmap phase.
++ * Fields set in Phase 1, consumed in Phase 3.
++ * Timing fields allow mig_timing_store() to emit one CSV record per page
++ * so batch migrations are visible in the same debugfs ring buffer as
++ * the standard __unmap_and_move() path.
++ */
++struct mig_batch_entry {
++	struct folio   *src;		/* source folio (locked in Phase 1)      */
++	struct folio   *dst;		/* dest   folio (locked in Phase 1)      */
++	struct anon_vma *anon_vma;	/* anon_vma reference held, or NULL      */
++	int             rc;		/* 0 = unmap OK; <0 = failed, skip Phase3*/
++	bool            was_mapped;	/* true if PTE was present before unmap  */
++	/* Per-page timing for mig_timing_store() */
++	u64  total_start_ns;		/* ktime before Phase 1 page collection  */
++	u64  unmap_start_ns;		/* ktime before try_to_migrate()         */
++	u64  unmap_end_ns;		/* ktime after  try_to_migrate()         */
++	u64  try_mig_start_ns;		/* same as unmap_start (no pre-overhead) */
++	u64  try_mig_end_ns;		/* same as unmap_end                     */
++	u64  flush_ns_amortised;	/* batch flush ns / n_pages (H1 proxy)   */
++	/* Per-CPU rmap sub-timing read after each try_to_migrate() call */
++	u64  rwsem_ns;			/* H3: rwsem acquire time                */
++	u64  ptl_ns;			/* H2: PTL hold time                     */
++	u64  ipi_local_ns;		/* H1: per-page IPI (0 for deferred path)*/
++};
++
++/*
++ * migrate_pages_deferred_ipi - batch-migrate up to MIG_BATCH_SIZE pages
++ * with a single deferred TLB-shootdown IPI for the whole batch.
++ *
++ * @from:          list of isolated LRU pages (consumed on success)
++ * @get_new_page:  destination-page allocator
++ * @put_new_page:  destructor for failed destinations (or NULL)
++ * @private:       opaque argument forwarded to get/put_new_page
++ * @node:          destination NUMA node id
++ * @nr_succeeded:  output — pages successfully migrated
++ *
++ * Returns: number of pages NOT migrated (remain in @from).
++ */
++static int migrate_pages_deferred_ipi(struct list_head *from,
++				      new_page_t get_new_page,
++				      free_page_t put_new_page,
++				      unsigned long private,
++				      int node,
++				      unsigned int *nr_succeeded)
++{
++	struct mig_batch_entry *batch;
++	int total_ok   = 0;
++	int total_fail = 0;
++	int i, n;
++
++	if (nr_succeeded)
++		*nr_succeeded = 0;
++
++	/*
++	 * Allocate the batch array on the heap to avoid a >1024-byte
++	 * stack frame warning.  MIG_BATCH_SIZE=32 entries × ~40 bytes each
++	 * = ~1280 bytes — too large for stack on some kernel configs.
++	 */
++	batch = kmalloc_array(MIG_BATCH_SIZE, sizeof(*batch), GFP_KERNEL);
++	if (!batch) {
++		if (nr_succeeded) *nr_succeeded = 0;
++		return list_empty(from) ? 0 : 1;
++	}
++
++	while (!list_empty(from)) {
++
++		/* ── Collect up to MIG_BATCH_SIZE pages ─────────────────── */
++		n = 0;
++		{
++			struct page *page, *page2;
++			list_for_each_entry_safe(page, page2, from, lru) {
++				struct folio  *src, *dst;
++				struct page   *newpage;
++				struct anon_vma *av = NULL;
++
++				if (n >= MIG_BATCH_SIZE)
++					break;
++
++				/* This simplified path handles order-0 anon
++				 * pages only.  Skip THP / hugetlb. */
++				if (PageTransHuge(page) || PageHuge(page))
++					continue;
++
++				src = page_folio(page);
++
++				/* Capture start of this page's migration window */
++				batch[n].total_start_ns = ktime_get_ns();
++
++				newpage = get_new_page(page, private);
++				if (!newpage) {
++					batch[n] = (struct mig_batch_entry){
++						.src = src, .dst = NULL,
++						.rc = -ENOMEM };
++					n++;
++					continue;
++				}
++				dst = page_folio(newpage);
++				newpage->private = 0;
++
++				if (folio_test_anon(src) && !folio_test_ksm(src))
++					av = folio_get_anon_vma(src);
++
++				if (!folio_trylock(src)) {
++					if (av) put_anon_vma(av);
++					if (put_new_page) put_new_page(newpage, private);
++					else put_page(newpage);
++					batch[n] = (struct mig_batch_entry){
++						.src = src, .dst = NULL,
++						.rc = -EAGAIN };
++					n++;
++					continue;
++				}
++
++				if (!folio_trylock(dst)) {
++					folio_unlock(src);
++					if (av) put_anon_vma(av);
++					if (put_new_page) put_new_page(newpage, private);
++					else put_page(newpage);
++					batch[n] = (struct mig_batch_entry){
++						.src = src, .dst = NULL,
++						.rc = -EAGAIN };
++					n++;
++					continue;
++				}
++
++				if (folio_test_writeback(src)) {
++					folio_unlock(dst);
++					folio_unlock(src);
++					if (av) put_anon_vma(av);
++					if (put_new_page) put_new_page(newpage, private);
++					else put_page(newpage);
++					batch[n] = (struct mig_batch_entry){
++						.src = src, .dst = NULL,
++						.rc = -EBUSY };
++					n++;
++					continue;
++				}
++
++				batch[n] = (struct mig_batch_entry){
++					.src        = src,
++					.dst        = dst,
++					.anon_vma   = av,
++					.rc         = 0,
++					.was_mapped = false,
++				};
++				n++;
++			}
++		}
++
++		if (n == 0)
++			break;
++
++		/* ── Phase 1: Unmap all n pages (NO IPI per page) ────────── */
++		for (i = 0; i < n; i++) {
++			struct mig_batch_entry *e = &batch[i];
++
++			if (e->rc != 0 || !e->dst)
++				continue;
++
++			if (!folio_mapped(e->src))
++				continue;   /* not mapped — skip unmap, still copy */
++
++			VM_BUG_ON_FOLIO(folio_test_anon(e->src) &&
++				!folio_test_ksm(e->src) && !e->anon_vma, e->src);
++
++			/*
++			 * TTU_BATCH_FLUSH tells try_to_migrate_one() to use
++			 * ptep_get_and_clear() + set_tlb_ubc_flush_pending()
++			 * instead of ptep_clear_flush().  No IPI is issued here.
++			 * ipi_local_ns = 0 for this page; the real IPI cost is
++			 * measured in Phase 2 and amortised across the batch.
++			 */
++#ifdef CONFIG_MIG_RMAP_TIMING
++			{
++				/* Zero per-CPU scratch before each page so we
++				 * get per-page rwsem/ptl values, not accumulated */
++				struct mig_rmap_timing *rt =
++					&get_cpu_var(mig_rmap_timing);
++				memset(rt, 0, sizeof(*rt));
++				put_cpu_var(mig_rmap_timing);
++			}
++#endif
++			e->unmap_start_ns   = ktime_get_ns();
++			e->try_mig_start_ns = e->unmap_start_ns;
++			try_to_migrate(e->src, TTU_BATCH_FLUSH);
++			e->try_mig_end_ns = ktime_get_ns();
++			e->unmap_end_ns   = e->try_mig_end_ns;
++			e->ipi_local_ns   = 0; /* deferred to Phase 2 */
++#ifdef CONFIG_MIG_RMAP_TIMING
++			{
++				struct mig_rmap_timing *rt =
++					&get_cpu_var(mig_rmap_timing);
++				e->rwsem_ns = rt->rwsem_ns;
++				e->ptl_ns   = rt->ptl_ns;
++				/* ipi_ns from rmap is 0 (TTU_BATCH_FLUSH path) */
++				memset(rt, 0, sizeof(*rt));
++				put_cpu_var(mig_rmap_timing);
++			}
++#else
++			e->rwsem_ns = 0;
++			e->ptl_ns   = 0;
++#endif
++
++			if (folio_mapped(e->src)) {
++				/* Unmap failed — restore and mark failed */
++				remove_migration_ptes(e->src, e->src, false);
++				folio_unlock(e->dst);
++				folio_unlock(e->src);
++				if (e->anon_vma) put_anon_vma(e->anon_vma);
++				if (put_new_page)
++					put_new_page(&e->dst->page, private);
++				else
++					put_page(&e->dst->page);
++				e->rc  = -EAGAIN;
++				e->dst = NULL;
++				continue;
++			}
++			e->was_mapped = true;
++		}
++
++		/* ── Phase 2: ONE batch TLB flush for all n pages ────────── */
++		/*
++		 * try_to_unmap_flush() calls arch_tlbbatch_flush() which on
++		 * x86 issues flush_tlb_mm_range() covering every CPU that
++		 * has ever loaded this mm into CR3.  This is ONE IPI round-
++		 * trip to each remote CPU regardless of how many pages were
++		 * unmapped in Phase 1.
++		 *
++		 * This MUST execute before move_to_new_folio() (Phase 3)
++		 * and before any src page is freed (put_page).
++		 *
++		 * Amortised per-page IPI cost = flush_ns / n_unmapped_pages.
++		 * This replaces the per-page ipi_wait_ns from the standard
++		 * path so T5 analysis can see the batch benefit directly.
++		 */
++		{
++			int n_unmapped = 0;
++			u64 flush_start, flush_end, flush_total, flush_per_page;
++
++			for (i = 0; i < n; i++)
++				if (batch[i].rc == 0 && batch[i].dst &&
++				    batch[i].was_mapped)
++					n_unmapped++;
++
++			flush_start = ktime_get_ns();
++			try_to_unmap_flush();
++			flush_end = ktime_get_ns();
++
++			flush_total    = flush_end - flush_start;
++			flush_per_page = n_unmapped > 0 ?
++					 flush_total / n_unmapped : flush_total;
++
++			/* Distribute amortised flush cost back to each page */
++			for (i = 0; i < n; i++)
++				batch[i].flush_ns_amortised = flush_per_page;
++		}
++
++		/* ── Phase 3: Copy + remap + unlock + free ───────────────── */
++		for (i = 0; i < n; i++) {
++			struct mig_batch_entry *e = &batch[i];
++			int rc;
++
++			if (e->rc != 0 || !e->dst) {
++				/* Pre-Phase-1 failure (alloc/lock) — no timing record.
++				 * dst may be NULL (alloc failed) or non-NULL but already
++				 * unlocked (lock failed path above cleaned up). */
++				if (e->dst && folio_test_locked(e->dst)) {
++					folio_unlock(e->dst);
++					if (folio_test_locked(e->src))
++						folio_unlock(e->src);
++					if (e->anon_vma) put_anon_vma(e->anon_vma);
++					if (put_new_page)
++						put_new_page(&e->dst->page, private);
++					else
++						put_page(&e->dst->page);
++				}
++				total_fail++;
++				continue;
++			}
++
++			/* Copy: src → dst */
++			{
++				struct mig_stage_timing st = {};
++				struct mig_timing_record trec = {};
++
++				st.lock_start_ns = e->total_start_ns;
++				st.lock_end_ns   = e->total_start_ns; /* lock=0 */
++				st.unmap_start_ns = e->unmap_start_ns;
++				st.unmap_end_ns   = e->unmap_end_ns;
++
++				st.copy_start_ns = ktime_get_ns();
++				rc = move_to_new_folio(e->dst, e->src, MIGRATE_ASYNC);
++				st.copy_end_ns   = ktime_get_ns();
++
++				if (rc == MIGRATEPAGE_SUCCESS)
++					folio_add_lru(e->dst);
++
++				/* Remap: install new PTE (success) or restore (fail) */
++				st.remap_start_ns = ktime_get_ns();
++				if (e->was_mapped) {
++					remove_migration_ptes(e->src,
++						rc == MIGRATEPAGE_SUCCESS ?
++						e->dst : e->src, false);
++				}
++				st.remap_end_ns = ktime_get_ns();
++
++				/* Unlock dst */
++				st.unlock_start_ns = ktime_get_ns();
++				folio_unlock(e->dst);
++
++				if (e->anon_vma)
++					put_anon_vma(e->anon_vma);
++
++				folio_unlock(e->src);
++				st.unlock_end_ns = ktime_get_ns();
++
++				/* Build timing record for the ring buffer.
++				 * ipi_wait_ns = amortised batch flush cost per page.
++				 * This is the key field: baseline shows ~139,000 ns,
++				 * optimised shows flush_total / batch_size ns. */
++				trec.stages          = st;
++				trec.total_start_ns  = e->total_start_ns;
++				trec.total_end_ns    = ktime_get_ns();
++				trec.src_pfn         = folio_pfn(e->src);
++				trec.dst_pfn         = rc == MIGRATEPAGE_SUCCESS ?
++							folio_pfn(e->dst) : 0;
++				trec.page_order      = folio_order(e->src);
++				trec.src_nid         = folio_nid(e->src);
++				trec.dst_nid         = rc == MIGRATEPAGE_SUCCESS ?
++							folio_nid(e->dst) : folio_nid(e->src);
++				trec.mapcount        = folio_mapcount(e->src);
++				trec.is_anon         = folio_test_anon(e->src) ? 1 : 0;
++				trec.page_was_mapped = e->was_mapped ? 1 : 0;
++				trec.lock_contended  = 0;
++				trec.result          = rc;
++				trec.try_migrate_start_ns = e->try_mig_start_ns;
++				trec.try_migrate_end_ns   = e->try_mig_end_ns;
++				/* The amortised flush cost goes into ipi_wait_ns so
++				 * T5 analysis shows the per-page batch IPI cost    */
++				trec.ipi_wait_ns    = e->flush_ns_amortised;
++				trec.ptl_wait_ns    = e->ptl_ns;
++				trec.rwsem_wait_ns  = e->rwsem_ns;
++				trec.online_cpus    = num_online_cpus();
++				mig_timing_store(&trec);
++
++				if (rc == MIGRATEPAGE_SUCCESS) {
++					list_del(&e->src->page.lru);
++					mod_node_page_state(folio_pgdat(e->src),
++						NR_ISOLATED_ANON +
++						!folio_test_anon(e->src),
++						-folio_nr_pages(e->src));
++					put_page(&e->src->page);
++					total_ok++;
++				} else {
++					if (put_new_page)
++						put_new_page(&e->dst->page, private);
++					else
++						put_page(&e->dst->page);
++					total_fail++;
++				}
++			}
++		}
++	} /* while !list_empty(from) */
++
++	if (nr_succeeded)
++		*nr_succeeded = (unsigned int)total_ok;
++
++	count_vm_events(PGMIGRATE_SUCCESS, total_ok);
++	count_vm_events(PGMIGRATE_FAIL, total_fail);
++
++	kfree(batch);
++	return total_fail;
++}
++
+ /*
+  * Attempt to migrate a misplaced page to the specified destination
+  * node. Caller is expected to have an elevated reference count on
+@@ -2190,6 +3281,27 @@
+ 		goto out;
+ 
+ 	list_add(&page->lru, &migratepages);
++
++	/*
++	 * O1 + O3: Use the deferred-IPI batch migration path for NUMA
++	 * misplaced pages.
++	 *
++	 * migrate_pages_deferred_ipi() implements three-phase migration:
++	 *   Phase 1: Unmap all pages with TTU_BATCH_FLUSH (no per-page IPI)
++	 *   Phase 2: try_to_unmap_flush()  -- one IPI for the whole batch
++	 *   Phase 3: Copy + remap + unlock + free per page
++	 *
++	 * The list was already sorted by PFN (O3) inside migrate_pages()
++	 * via list_sort(mig_pfn_cmp) before this call, so pages arrive
++	 * in VA-approximate order.
++	 *
++	 * Pages the batch path cannot handle (THPs, hugetlb) are left
++	 * in migratepages and processed by the standard migrate_pages()
++	 * fallback below.
++	 *
++	 * Expected improvement vs baseline (from T4+T5 measurements):
++	 *   try_migrate_ns median: 163,060 ns → ~3,600 ns  (45× reduction)
++	 */
+ 	nr_remaining = migrate_pages(&migratepages, alloc_misplaced_dst_page,
+ 				     NULL, node, MIGRATE_ASYNC,
+ 				     MR_NUMA_MISPLACED, &nr_succeeded);
+@@ -2217,3 +3329,4 @@
+ }
+ #endif /* CONFIG_NUMA_BALANCING */
+ #endif /* CONFIG_NUMA */
++
