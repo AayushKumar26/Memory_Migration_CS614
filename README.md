@@ -119,5 +119,3 @@ The deferred batch approach phase-separates the migration loop so N pages share 
 | Disruption Factor (KVM, real tiering HW) | — | **1.093 – 1.098** | Net-beneficial |
 
 ---
-
-*Linux 6.1.4 · CS614 Operating Systems · IIT Kanpur*
