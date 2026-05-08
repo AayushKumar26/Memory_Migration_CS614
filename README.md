@@ -3,7 +3,7 @@
 
 | | |
 |---|---|
-| **Course** | CS614 — Operating Systems, IIT Kanpur |
+| **Course** | CS614 — Linux Kernel Programming, IIT Kanpur |
 | **Team** | `team_name.ko` |
 | **Members** |  Aayush Kumar (230027) · Yogit (211207) · Cezan Vispi Damania (230310) |
 | **Kernel** | Linux 6.1.4 |
