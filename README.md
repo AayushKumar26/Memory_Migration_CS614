@@ -8,7 +8,7 @@
 | **Members** |  Aayush Kumar (230027) · Yogit (211207) · Cezan Vispi Damania (230310) |
 | **Kernel** | Linux 6.1.4 |
 | **Evaluation** | Emulated NUMA (`numa=fake=2`) + real multi-node tiering systems |
-| **Report** | [`project_report.pdf`](project_report.pdf) · [`Project_Presentation.pdf`](Project_Presentation.pdf) |
+| **Report** | [`project_report.pdf`](project_report.pdf) · [`Project_Presentation.pdf`](Project Presentation.pdf) |
 
 ---
 
